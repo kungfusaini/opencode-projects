@@ -9,18 +9,18 @@ OpenCode server plugin for project worklog tracking and `/worklog` orientation.
 - Hidden recap injection when enabling tracking, so the assistant can give a short orientation summary without dumping raw JSONL entries.
 - A small reminder while tracking is enabled so the assistant appends meaningful updates and can read deeper history only when needed.
 
-## Local usage
+## Usage
 
 Add the package to global `~/.config/opencode/opencode.json`:
 
 ```json
 {
   "plugin": [
-    ["file:///Users/sumeet/matrix/tools/opencode/opencode-worklog", {}]
+    "@kungfusaini/opencode-worklog"
   ]
 }
 ```
 
 Keep `~/.config/opencode/commands/worklog.md` present so the TUI recognizes `/worklog` as a slash command.
 
-After changing plugin code or config, restart opencode.
+After changing plugin config, restart opencode.
