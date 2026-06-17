@@ -1,0 +1,43 @@
+{
+  "name": "@kungfusaini/opencode-worklog",
+  "version": "0.1.0",
+  "description": "OpenCode server plugin for project worklog tracking and /worklog orientation.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sumeet Saini",
+  "homepage": "https://github.com/kungfusaini/opencode-worklog#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kungfusaini/opencode-worklog.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kungfusaini/opencode-worklog/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "worklog",
+    "agent-memory"
+  ],
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "main": "./src/index.js",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node --check src/worklog.js && node --check src/index.js"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
