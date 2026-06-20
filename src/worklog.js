@@ -141,17 +141,32 @@ export function worklogRecap(info) {
   const latest = entries.at(-1)
 
   return [
-    "Worklog recap for this project.",
+    `Worklog recap for this ${info.scope === "stream" ? "stream" : "project"}.`,
     `Worklog file: ${info.log}`,
-    `Project: ${projectLabel(info)}`,
+    `Project: ${info.project?.name || projectLabel(info)}`,
+    info.stream ? `Stream: ${info.stream.name || info.stream.id}` : undefined,
     latest ? `Latest status: ${latest.summary}` : "Latest status: none yet",
     "Recent worklog entries:",
     recent.length ? recent.map(compactEntry).join("\n") : "- none yet",
     "Use this recap to orient yourself. Do not dump the raw entries into the user-visible response.",
     "If deeper project history is needed later, read the worklog file above.",
-  ].join("\n")
+  ].filter(Boolean).join("\n")
 }
 
 export function worklogReminder(info) {
-  return `Worklog tracking is enabled. For meaningful progress, decisions, blockers, mistakes, finishes, or next steps, append a concise entry with worklog_append. If deeper project history is needed, read the project worklog file: ${info.log}`
+  const project = info.project?.name || projectLabel(info)
+  if (info.scope === "stream" && info.stream) {
+    return [
+      `Worklog tracking is enabled for selected stream: ${project} / ${info.stream.name || info.stream.id}.`,
+      `Use only this selected stream worklog for continuity unless the user explicitly asks for another stream or project-wide history: ${info.log}`,
+      "Do not read sibling stream worklogs or the parent project worklog by default.",
+      "For meaningful progress, decisions, blockers, mistakes, finishes, or next steps, append a concise entry with worklog_append; it writes to the selected stream.",
+    ].join(" ")
+  }
+  return [
+    `Worklog tracking is enabled for project: ${project}.`,
+    `Use only this project worklog for continuity unless the user explicitly asks for stream-specific history: ${info.log}`,
+    "Do not read stream worklogs by default from project scope.",
+    "For meaningful progress, decisions, blockers, mistakes, finishes, or next steps, append a concise entry with worklog_append.",
+  ].join(" ")
 }

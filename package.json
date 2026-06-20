@@ -1,7 +1,7 @@
 {
   "name": "@kungfusaini/opencode-worklog",
-  "version": "0.1.1",
-  "description": "OpenCode server plugin for project worklog tracking and /worklog orientation.",
+  "version": "0.2.0",
+  "description": "OpenCode server plugin for project worklog tracking, durable plans, and continuity orientation.",
   "type": "module",
   "license": "MIT",
   "author": "Sumeet Saini",
@@ -17,10 +17,12 @@
     "opencode",
     "opencode-plugin",
     "worklog",
+    "plans",
     "agent-memory"
   ],
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./tui": "./src/tui.js"
   },
   "main": "./src/index.js",
   "files": [
@@ -32,10 +34,12 @@
     "access": "public"
   },
   "scripts": {
-    "check": "node --check src/worklog.js && node --check src/index.js"
+    "check": "node --check src/worklog.js && node --check src/plans.js && node --check src/projects.js && node --check src/index.js && node --check src/tui.js"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "latest"
+    "@opencode-ai/plugin": "latest",
+    "@opentui/solid": "0.3.4",
+    "solid-js": "1.9.12"
   },
   "engines": {
     "node": ">=20"

@@ -1,0 +1,1297 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import path from "node:path"
+import {
+  archiveProject,
+  archiveStream,
+  clearStreamSelection,
+  createIndexedStream,
+  deleteArchivedProject,
+  deleteArchivedStream,
+  hydrateProject,
+  listArchivedProjects,
+  listProjects,
+  listStreams,
+  readSelection,
+  readStream,
+  renameProject,
+  renameStream,
+  restoreProject,
+  restoreStream,
+  selectProject,
+  selectStream,
+  setProjectPinned,
+  setStreamPinned,
+  resolveContext,
+  resolveProject,
+} from "./projects.js"
+import { ensureStore, readAllEntries } from "./worklog.js"
+
+export const id = "opencode-worklog-tui"
+
+const NEW_SESSION = "__new__"
+const NEW_STREAM = "__new_stream__"
+const PROJECT_WORKLOG = "__project__"
+const BACK_PROJECTS = "__back_projects__"
+const BACK_STREAMS = "__back_streams__"
+const ARCHIVED_PROJECTS = "__archived_projects__"
+const PROJECT_SHORTCUTS = "__project_shortcuts__"
+const ARCHIVE_SHORTCUTS = "__archive_shortcuts__"
+const WORKLOG_INFO = "__worklog_info__"
+const ARCHIVED_STREAMS = "__archived_streams__"
+const STREAM_SHORTCUTS = "__stream_shortcuts__"
+const ARCHIVED_STREAM_SHORTCUTS = "__archived_stream_shortcuts__"
+const SESSION_SHORTCUTS = "__session_shortcuts__"
+
+let solidRuntime
+let modalShortcuts
+
+async function ensureSolidRuntime() {
+  if (!solidRuntime) solidRuntime = await import("@opentui/solid")
+  return solidRuntime
+}
+
+function selectedProject() {
+  const selection = readSelection()
+  return selection.projectID ? hydrateProject(selection.projectID) : undefined
+}
+
+function activeProject(api) {
+  return selectedProject() || resolveProject(api.state.path.directory)
+}
+
+function activeStream(project) {
+  const selection = readSelection()
+  return selection.projectID === project.id && selection.streamID ? readStream(project, selection.streamID) : undefined
+}
+
+function contextLabels(api) {
+  const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
+  const info = resolveContext(api.state.path.directory, { sessionID })
+  const project = info.project
+  const stream = info.stream
+  const session = sessionID ? api.state.session.get(sessionID) : undefined
+  return {
+    project: project.name || project.id,
+    stream: stream?.name || "Project worklog",
+    session: session ? sessionTitle(session) : sessionID || "None",
+    workdir: formatHomePath(info.root || project.root || api.state.path.directory),
+  }
+}
+
+function currentWorklogInfo(api) {
+  const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
+  return resolveContext(api.state.path.directory, { sessionID })
+}
+
+function formatHomePath(value) {
+  const home = homedir()
+  if (!value || !home) return value || ""
+  if (value === home) return "~"
+  if (value.startsWith(`${home}/`)) return `~/${value.slice(home.length + 1)}`
+  return value
+}
+
+function projectDescription(project, selected) {
+  const bits = []
+  if (selected) bits.push("selected")
+  if (project.root) bits.push(formatHomePath(project.root))
+  return bits.join(" · ")
+}
+
+function streamDescription(stream, selected) {
+  const bits = []
+  if (selected) bits.push("selected")
+  if (stream.purpose) bits.push(stream.purpose)
+  if (stream.workspace?.mode) bits.push(stream.workspace.mode)
+  return bits.join(" · ")
+}
+
+function sessionTitle(session) {
+  const title = session.title || session.slug || session.id
+  if (/^New session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(title)) return "New session"
+  if (/^Child session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(title)) return "Child session"
+  return title
+}
+
+function sessionDescription() {
+  return undefined
+}
+
+function dateCategory(timestamp) {
+  const updated = new Date(timestamp || 0)
+  const today = new Date()
+  if (updated.toDateString() === today.toDateString()) return "Today"
+  return updated.toDateString()
+}
+
+function sessionCategory(session) {
+  return dateCategory(session.time?.updated)
+}
+
+function projectCategory(project) {
+  if (project.pinned) return "Pinned"
+  return dateCategory(project.updatedAt || project.createdAt)
+}
+
+function streamCategory(stream) {
+  return dateCategory(stream.updatedAt || stream.createdAt)
+}
+
+function worklogContext(api) {
+  return ensureStore(currentWorklogInfo(api))
+}
+
+function worklogTitle(info) {
+  const project = info.project?.name || info.project?.id || info.id
+  if (info.scope === "stream" && info.stream?.name) return `${project} · ${info.stream.name}`
+  return `${project} · Project worklog`
+}
+
+function shortTime(timestamp) {
+  if (!timestamp) return "No time"
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return String(timestamp)
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
+function truncate(value, length = 120) {
+  const text = String(value || "")
+  if (text.length <= length) return text
+  return `${text.slice(0, length - 1)}…`
+}
+
+function entryTitle(entry) {
+  const type = entry.type ? `${entry.type[0]?.toUpperCase() || ""}${entry.type.slice(1)}` : "Entry"
+  return `${type}: ${entry.summary || entry.result || entry.next || "No summary"}`
+}
+
+function entryDescription(entry) {
+  const bits = [shortTime(entry.time)]
+  if (entry.task) bits.push(`task: ${entry.task}`)
+  if (entry.next) bits.push(`next: ${truncate(entry.next, 80)}`)
+  if (entry.blocker) bits.push(`blocker: ${truncate(entry.blocker, 80)}`)
+  if (entry.result && !entry.next) bits.push(`result: ${truncate(entry.result, 80)}`)
+  return bits.filter(Boolean).join(" · ")
+}
+
+function entryDetail(entry, info) {
+  const lines = [
+    `Project: ${info.project?.name || info.project?.id || info.id}`,
+    `Stream: ${info.stream?.name || "Project worklog"}`,
+    `Type: ${entry.type || "entry"}`,
+    `Time: ${entry.time || "unknown"}`,
+  ]
+  if (entry.task) lines.push(`Task: ${entry.task}`)
+  if (entry.summary) lines.push("", `Summary: ${entry.summary}`)
+  if (entry.result) lines.push("", `Result: ${entry.result}`)
+  if (entry.next) lines.push("", `Next: ${entry.next}`)
+  if (entry.reason) lines.push("", `Reason: ${entry.reason}`)
+  if (entry.lesson) lines.push("", `Lesson: ${entry.lesson}`)
+  if (entry.blocker) lines.push("", `Blocker: ${entry.blocker}`)
+  if (entry.files?.length) lines.push("", "Files:", ...entry.files.map((file) => `- ${formatHomePath(file)}`))
+  return lines.join("\n")
+}
+
+function worklogOptions(info, entries) {
+  return [
+    {
+      title: `${entries.length} entries · ${formatHomePath(info.log)}`,
+      value: WORKLOG_INFO,
+      category: "Worklog",
+    },
+    ...entries
+      .map((entry, index) => ({ entry, index }))
+      .toReversed()
+      .map(({ entry, index }) => ({
+        title: entryTitle(entry),
+        value: String(index),
+        description: entryDescription(entry),
+        category: dateCategory(entry.time),
+      })),
+  ]
+}
+
+function showError(api, title, error) {
+  api.ui.toast({
+    variant: "error",
+    title,
+    message: error instanceof Error ? error.message : String(error),
+  })
+}
+
+function showWorklogViewer(api) {
+  try {
+    const info = worklogContext(api)
+    const entries = readAllEntries(info.log)
+    api.ui.dialog.setSize("large")
+    api.ui.dialog.replace(() =>
+      api.ui.DialogSelect({
+        title: `View worklog · ${worklogTitle(info)}`,
+        placeholder: entries.length ? "Search worklog entries..." : "No worklog entries",
+        options: worklogOptions(info, entries),
+        onSelect(option) {
+          if (option.value === WORKLOG_INFO) return
+          const entry = entries[Number(option.value)]
+          if (!entry) return
+          api.ui.dialog.clear()
+          showWorklogEntry(api, info, entries, entry)
+        },
+      }),
+    )
+  } catch (error) {
+    api.ui.dialog.clear()
+    showError(api, "Failed to open worklog", error)
+  }
+}
+
+function showWorklogEntry(api, info, entries, entry) {
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: entryTitle(entry),
+      message: entryDetail(entry, info),
+      onConfirm() {
+        api.ui.dialog.clear()
+        showWorklogViewer(api)
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showWorklogViewer(api)
+      },
+    }),
+  )
+}
+
+function showWorklogContext(api) {
+  const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
+  const info = ensureStore(resolveContext(api.state.path.directory, { sessionID }))
+  const sessionSource = sessionID && info.stream ? "stream session index" : info.stream ? "selected stream" : "project"
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Worklog context",
+      message: [
+        `Project: ${info.project?.name || info.project?.id || info.id}`,
+        `Stream: ${info.stream?.name || "Project worklog"}`,
+        `Session: ${sessionID || "None"}`,
+        `Scope: ${info.scope}`,
+        `Source: ${sessionSource}`,
+        `Workdir: ${formatHomePath(info.root)}`,
+        `Worklog: ${formatHomePath(info.log)}`,
+        `Plans: ${formatHomePath(info.plans)}`,
+      ].join("\n"),
+      onConfirm() {
+        api.ui.dialog.clear()
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+      },
+    }),
+  )
+}
+
+function clearModalShortcuts() {
+  if (modalShortcuts?.dispose) modalShortcuts.dispose()
+  modalShortcuts = undefined
+}
+
+function setModalShortcuts(api, state) {
+  clearModalShortcuts()
+  modalShortcuts = {
+    state,
+    dispose: api.keymap.registerLayer({
+      priority: 100,
+      commands: [
+        { name: "worklog.modal.pin", run: () => runModalShortcut(api, "pin") },
+        { name: "worklog.modal.rename", run: () => runModalShortcut(api, "rename") },
+        { name: "worklog.modal.delete", run: () => runModalShortcut(api, "delete") },
+      ],
+      bindings: [
+        { key: "ctrl+f", cmd: "worklog.modal.pin" },
+        { key: "ctrl+r", cmd: "worklog.modal.rename" },
+        { key: "ctrl+d", cmd: "worklog.modal.delete" },
+      ],
+    }),
+  }
+}
+
+function runModalShortcut(api, action) {
+  const state = modalShortcuts?.state
+  if (!state) return false
+  if (state.kind === "projects") return runProjectShortcut(api, state, action)
+  if (state.kind === "archived-projects") return runArchivedProjectShortcut(api, state, action)
+  if (state.kind === "streams") return runStreamShortcut(api, state, action)
+  if (state.kind === "archived-streams") return runArchivedStreamShortcut(api, state, action)
+  if (state.kind === "sessions") return runSessionShortcut(api, state, action)
+  return false
+}
+
+function selectedProjectFromState(state) {
+  const value = state.selected?.value
+  if (!value || value === ARCHIVED_PROJECTS || value === BACK_PROJECTS || value === PROJECT_SHORTCUTS || value === ARCHIVE_SHORTCUTS) return undefined
+  return state.projects.find((project) => project.id === value)
+}
+
+function selectedStreamFromState(state) {
+  const value = state.selected?.value
+  if (!value || value === BACK_PROJECTS || value === BACK_STREAMS || value === PROJECT_WORKLOG || value === NEW_STREAM || value === ARCHIVED_STREAMS || value === STREAM_SHORTCUTS || value === ARCHIVED_STREAM_SHORTCUTS) return undefined
+  return state.streams.find((stream) => stream.id === value)
+}
+
+function selectedSessionFromState(state) {
+  const value = state.selected?.value
+  if (!value || value === BACK_STREAMS || value === NEW_SESSION || value === SESSION_SHORTCUTS) return undefined
+  return state.sessions.find((session) => session.id === value)
+}
+
+function runProjectShortcut(api, state, action) {
+  const project = selectedProjectFromState(state)
+  if (!project) return false
+
+  if (action === "pin") {
+    const next = setProjectPinned(project.id, !project.pinned)
+    api.ui.toast({ variant: "success", title: next.pinned ? "Project pinned" : "Project unpinned", message: next.name || next.id })
+    showProjectViewer(api, next.id)
+    return true
+  }
+
+  if (action === "rename") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showRenameProjectPrompt(api, project)
+    return true
+  }
+
+  if (action === "delete") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showArchiveProjectConfirm(api, project)
+    return true
+  }
+
+  return false
+}
+
+function runArchivedProjectShortcut(api, state, action) {
+  const project = selectedProjectFromState(state)
+  if (!project) return false
+
+  if (action === "rename") {
+    try {
+      const restored = restoreProject(project.id)
+      api.ui.toast({ variant: "success", title: "Project restored", message: restored.name || restored.id })
+      showArchivedProjectsViewer(api)
+    } catch (error) {
+      showError(api, "Failed to restore project", error)
+    }
+    return true
+  }
+
+  if (action === "delete") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showDeleteArchivedProjectConfirm(api, project)
+    return true
+  }
+
+  return false
+}
+
+function runStreamShortcut(api, state, action) {
+  const stream = selectedStreamFromState(state)
+  if (!stream) return false
+
+  if (action === "pin") {
+    const next = setStreamPinned(state.project, stream.id, !stream.pinned)
+    api.ui.toast({ variant: "success", title: next.pinned ? "Stream pinned" : "Stream unpinned", message: next.name || next.id })
+    showStreamViewer(api, state.project)
+    return true
+  }
+
+  if (action === "rename") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showRenameStreamPrompt(api, state.project, stream)
+    return true
+  }
+
+  if (action === "delete") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showArchiveStreamConfirm(api, state.project, stream)
+    return true
+  }
+
+  return false
+}
+
+function runArchivedStreamShortcut(api, state, action) {
+  const stream = selectedStreamFromState(state)
+  if (!stream) return false
+
+  if (action === "rename") {
+    try {
+      const restored = restoreStream(state.project, stream.id)
+      api.ui.toast({ variant: "success", title: "Stream restored", message: restored.name || restored.id })
+      showArchivedStreamsViewer(api, state.project)
+    } catch (error) {
+      showError(api, "Failed to restore stream", error)
+    }
+    return true
+  }
+
+  if (action === "delete") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showDeleteArchivedStreamConfirm(api, state.project, stream)
+    return true
+  }
+
+  return false
+}
+
+function runSessionShortcut(api, state, action) {
+  const session = selectedSessionFromState(state)
+  if (!session) return false
+
+  if (action === "pin") {
+    const pinned = !sessionIndexEntry(state.project, session.id)?.pinned
+    setSessionPinned(state.project, session.id, pinned)
+    api.ui.toast({ variant: "success", title: pinned ? "Session pinned" : "Session unpinned", message: sessionTitle(session) })
+    showSessionViewer(api, state.project)
+    return true
+  }
+
+  if (action === "rename") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showRenameSessionPrompt(api, state.project, session)
+    return true
+  }
+
+  if (action === "delete") {
+    clearModalShortcuts()
+    api.ui.dialog.clear()
+    showDeleteSessionConfirm(api, state.project, session)
+    return true
+  }
+
+  return false
+}
+
+function sessionStream(project) {
+  return activeStream(project)
+}
+
+function sessionDirectory(project) {
+  return project.root
+}
+
+function preserveSessionContext(project) {
+  const stream = sessionStream(project)
+  if (stream) selectStream(project.id, stream.id)
+  else selectProject(project.id)
+}
+
+function readJson(file, fallback) {
+  if (!existsSync(file)) return fallback
+  try {
+    return JSON.parse(readFileSync(file, "utf8"))
+  } catch {
+    return fallback
+  }
+}
+
+function writeJson(file, value) {
+  mkdirSync(path.dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8")
+}
+
+function streamSessionIndexPath(stream) {
+  return path.join(stream.dir, "sessions.json")
+}
+
+function projectSessionIndexPath(project) {
+  return path.join(project.dir, "sessions.json")
+}
+
+function currentSessionIndexTarget(project) {
+  return sessionStream(project) || project
+}
+
+function sessionIndexPath(target) {
+  return target.projectID ? streamSessionIndexPath(target) : projectSessionIndexPath(target)
+}
+
+function readSessionIndex(target) {
+  const index = readJson(sessionIndexPath(target), { v: 1, sessions: {} })
+  return {
+    v: index.v || 1,
+    lastSessionID: typeof index.lastSessionID === "string" ? index.lastSessionID : undefined,
+    sessions: index.sessions && typeof index.sessions === "object" ? index.sessions : {},
+  }
+}
+
+function readStreamSessionIndex(stream) {
+  return readSessionIndex(stream)
+}
+
+function writeSessionIndex(target, index) {
+  writeJson(sessionIndexPath(target), index)
+}
+
+function recordSession(target, sessionID, patch = {}, options = {}) {
+  if (!target || !sessionID) return
+  const index = readSessionIndex(target)
+  const existing = index.sessions[sessionID]
+  index.sessions[sessionID] = {
+    id: sessionID,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...existing,
+    ...patch,
+  }
+  if (options.remember !== false) index.lastSessionID = sessionID
+  writeSessionIndex(target, index)
+}
+
+function recordStreamSession(stream, sessionID) {
+  recordSession(stream, sessionID)
+}
+
+function removeSessionRecord(project, sessionID) {
+  for (const target of [project, ...listStreams(project, "all")]) {
+    const index = readSessionIndex(target)
+    if (!index.sessions[sessionID]) continue
+    delete index.sessions[sessionID]
+    if (index.lastSessionID === sessionID) delete index.lastSessionID
+    writeSessionIndex(target, index)
+  }
+}
+
+function sessionIndexEntry(project, sessionID) {
+  const target = currentSessionIndexTarget(project)
+  return readSessionIndex(target).sessions[sessionID]
+}
+
+function setSessionPinned(project, sessionID, pinned) {
+  recordSession(currentSessionIndexTarget(project), sessionID, { pinned: Boolean(pinned) }, { remember: false })
+}
+
+function rememberedSessionID(project, sessions) {
+  const lastSessionID = readSessionIndex(currentSessionIndexTarget(project)).lastSessionID
+  if (lastSessionID && sessions.some((session) => session.id === lastSessionID)) return lastSessionID
+  return undefined
+}
+
+function projectStreamSessionIDs(project) {
+  const ids = new Set()
+  for (const stream of listStreams(project, "active")) {
+    for (const id of Object.keys(readStreamSessionIndex(stream).sessions)) ids.add(id)
+  }
+  return ids
+}
+
+async function listProjectRootSessions(api, project, limit = 100) {
+  const directory = sessionDirectory(project)
+  if (!directory) throw new Error(`Project ${project.id} has no session directory`)
+  const result = await api.client.session.list({
+    directory,
+    scope: "project",
+    roots: true,
+    limit,
+  })
+  const stream = sessionStream(project)
+  const streamSessionIDs = stream ? new Set(Object.keys(readStreamSessionIndex(stream).sessions)) : undefined
+  const projectAssignedStreamSessionIDs = stream ? undefined : projectStreamSessionIDs(project)
+  const sessions = (result.data ?? [])
+    .filter((session) => !session.parentID)
+    .filter((session) => !streamSessionIDs || streamSessionIDs.has(session.id))
+    .filter((session) => !projectAssignedStreamSessionIDs || !projectAssignedStreamSessionIDs.has(session.id))
+  return sessions.toSorted((a, b) => {
+    const aPinned = Boolean(sessionIndexEntry(project, a.id)?.pinned)
+    const bPinned = Boolean(sessionIndexEntry(project, b.id)?.pinned)
+    if (aPinned !== bPinned) return aPinned ? -1 : 1
+    return (b.time?.updated || 0) - (a.time?.updated || 0)
+  })
+}
+
+async function createProjectSession(api, project) {
+  const directory = sessionDirectory(project)
+  if (!directory) throw new Error(`Project ${project.id} has no session directory`)
+  const sessionID = (await api.client.session.create({ directory })).data?.id
+  if (!sessionID) throw new Error("No session id returned")
+  recordSession(currentSessionIndexTarget(project), sessionID)
+  api.route.navigate("session", { sessionID })
+  return sessionID
+}
+
+function showProjectViewer(api, currentProjectID) {
+  const currentProject = resolveProject(api.state.path.directory)
+  const selection = readSelection()
+  const projects = listProjects()
+  const options = [
+    {
+      title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d archive",
+      value: PROJECT_SHORTCUTS,
+      category: "Shortcuts",
+    },
+    { title: "Archived projects", value: ARCHIVED_PROJECTS, category: "Navigation" },
+    ...projects.map((project) => ({
+      title: project.name || project.id,
+      value: project.id,
+      description: projectDescription(project, selection.projectID === project.id),
+      category: projectCategory(project),
+    })),
+  ]
+
+  if (!projects.some((project) => project.id === currentProject.id)) {
+    options.unshift({
+      title: currentProject.name || currentProject.id,
+      value: currentProject.id,
+      description: projectDescription(currentProject, selection.projectID === currentProject.id),
+      category: projectCategory(currentProject),
+    })
+  }
+
+  const state = {
+    kind: "projects",
+    projects: options
+      .map((option) => listProjects().find((project) => project.id === option.value) || (option.value === currentProject.id ? currentProject : undefined))
+      .filter(Boolean),
+    selected: options.find((option) => option.value === (currentProjectID || selection.projectID)) || options[0],
+  }
+  setModalShortcuts(api, state)
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Open workspace · Project",
+      placeholder: "Search projects...",
+      options,
+      current: currentProjectID || selection.projectID,
+      onMove(option) {
+        state.selected = option
+      },
+      onSelect(option) {
+        clearModalShortcuts()
+        if (option.value === ARCHIVED_PROJECTS) {
+          api.ui.dialog.clear()
+          showArchivedProjectsViewer(api)
+          return
+        }
+
+        if (option.value === PROJECT_SHORTCUTS) return
+
+        const project = listProjects().find((item) => item.id === option.value) || currentProject
+        selectProject(project.id)
+        api.ui.dialog.clear()
+        showStreamViewer(api, project)
+      },
+    }),
+    () => clearModalShortcuts(),
+  )
+}
+
+function showRenameProjectPrompt(api, project) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "Rename project",
+      placeholder: project.name || project.id,
+      value: project.name || "",
+      onConfirm(value) {
+        try {
+          const next = renameProject(project.id, value)
+          api.ui.dialog.clear()
+          showProjectViewer(api, next.id)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to rename project", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showProjectViewer(api, project.id)
+      },
+    }),
+  )
+}
+
+function showArchiveProjectConfirm(api, project) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Archive project",
+      message: `Archive project "${project.name || project.id}"? Worklogs, plans, and streams will be kept locally.`,
+      onConfirm() {
+        try {
+          archiveProject(project.id)
+          const selection = readSelection()
+          if (selection.projectID === project.id) clearStreamSelection()
+          api.ui.dialog.clear()
+          showProjectViewer(api)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to archive project", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showProjectViewer(api, project.id)
+      },
+    }),
+  )
+}
+
+function showArchivedProjectsViewer(api) {
+  const archived = listArchivedProjects()
+  const options = [
+    { title: "← Back to projects", value: BACK_PROJECTS, category: "Navigation" },
+    {
+      title: "ctrl+r restore · ctrl+d delete permanently",
+      value: ARCHIVE_SHORTCUTS,
+      category: "Shortcuts",
+    },
+    ...archived.map((project) => ({
+      title: project.name || project.id,
+      value: project.id,
+      description: project.root ? formatHomePath(project.root) : undefined,
+      category: project.archivedAt ? dateCategory(project.archivedAt) : "Archived",
+    })),
+    {
+      title: "ctrl+r restore · ctrl+d delete permanently",
+      value: "__archive_shortcuts__",
+      category: "Shortcuts",
+      disabled: true,
+    },
+  ]
+  const state = {
+    kind: "archived-projects",
+    projects: archived,
+    selected: options[0],
+  }
+  setModalShortcuts(api, state)
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Archived projects",
+      placeholder: archived.length ? "Search archived projects..." : "No archived projects",
+      options,
+      onMove(option) {
+        state.selected = option
+      },
+      onSelect(option) {
+        clearModalShortcuts()
+        if (option.value === BACK_PROJECTS) {
+          api.ui.dialog.clear()
+          showProjectViewer(api)
+          return
+        }
+
+        if (option.value === ARCHIVE_SHORTCUTS) return
+
+        if (option.value === ARCHIVE_SHORTCUTS) return
+      },
+    }),
+    () => clearModalShortcuts(),
+  )
+}
+
+function showDeleteArchivedProjectConfirm(api, project) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Delete archived project permanently",
+      message: [
+        `Delete archived project "${project.name || project.id}" permanently?`,
+        "This deletes local worklog data only. It will not delete the code repository.",
+      ].join("\n"),
+      onConfirm() {
+        try {
+          deleteArchivedProject(project.id)
+          api.ui.dialog.clear()
+          showArchivedProjectsViewer(api)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to delete archived project", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showArchivedProjectsViewer(api)
+      },
+    }),
+  )
+}
+
+function showRenameStreamPrompt(api, project, stream) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "Rename stream",
+      placeholder: stream.name || stream.id,
+      value: stream.name || "",
+      onConfirm(value) {
+        try {
+          renameStream(project, stream.id, value)
+          api.ui.dialog.clear()
+          showStreamViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to rename stream", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showStreamViewer(api, project)
+      },
+    }),
+  )
+}
+
+function showArchiveStreamConfirm(api, project, stream) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Archive stream",
+      message: `Archive stream "${stream.name || stream.id}"? Worklogs, plans, and stream sessions will be kept locally.`,
+      onConfirm() {
+        try {
+          archiveStream(project, stream.id)
+          api.ui.dialog.clear()
+          showStreamViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to archive stream", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showStreamViewer(api, project)
+      },
+    }),
+  )
+}
+
+function showArchivedStreamsViewer(api, project) {
+  const archived = listStreams(project, "archived")
+  const options = [
+    { title: "← Back to streams", value: BACK_STREAMS, category: "Navigation" },
+    { title: "ctrl+r restore · ctrl+d delete permanently", value: ARCHIVED_STREAM_SHORTCUTS, category: "Shortcuts" },
+    ...archived.map((stream) => ({
+      title: stream.name || stream.id,
+      value: stream.id,
+      description: stream.purpose,
+      category: stream.archivedAt ? dateCategory(stream.archivedAt) : "Archived",
+    })),
+  ]
+  const state = { kind: "archived-streams", project, streams: archived, selected: options[0] }
+  setModalShortcuts(api, state)
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: `Archived streams · ${project.name || project.id}`,
+      placeholder: archived.length ? "Search archived streams..." : "No archived streams",
+      options,
+      onMove(option) {
+        state.selected = option
+      },
+      onSelect(option) {
+        clearModalShortcuts()
+        if (option.value === BACK_STREAMS) {
+          api.ui.dialog.clear()
+          showStreamViewer(api, project)
+        }
+      },
+    }),
+    () => clearModalShortcuts(),
+  )
+}
+
+function showDeleteArchivedStreamConfirm(api, project, stream) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Delete archived stream permanently",
+      message: [
+        `Delete archived stream "${stream.name || stream.id}" permanently?`,
+        "This deletes local stream worklog, plans, and session index data only. It will not delete code or opencode sessions.",
+      ].join("\n"),
+      onConfirm() {
+        try {
+          deleteArchivedStream(project, stream.id)
+          api.ui.dialog.clear()
+          showArchivedStreamsViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to delete archived stream", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showArchivedStreamsViewer(api, project)
+      },
+    }),
+  )
+}
+
+function showStreamViewer(api, project) {
+  const selection = readSelection()
+  const streams = listStreams(project, "active")
+  const options = [
+    { title: "← Back to projects", value: BACK_PROJECTS, category: "Navigation" },
+    { title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d archive", value: STREAM_SHORTCUTS, category: "Shortcuts" },
+    { title: "Archived streams", value: ARCHIVED_STREAMS, category: "Navigation" },
+    { title: "Project worklog", value: PROJECT_WORKLOG, description: "No stream", category: "Streams" },
+    { title: "New stream", value: NEW_STREAM, description: "Create and select a stream", category: "Streams" },
+    ...streams.map((stream) => ({
+      title: stream.name || stream.id,
+      value: stream.id,
+      description: streamDescription(stream, selection.streamID === stream.id),
+      category: stream.pinned ? "Pinned" : streamCategory(stream),
+    })),
+  ]
+  const state = { kind: "streams", project, streams, selected: options[0] }
+  setModalShortcuts(api, state)
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: `Open workspace · Stream · ${project.name || project.id}`,
+      placeholder: "Search streams...",
+      options,
+      current: selection.streamID || PROJECT_WORKLOG,
+      onMove(option) {
+        state.selected = option
+      },
+      onSelect(option) {
+        clearModalShortcuts()
+        if (option.value === BACK_PROJECTS) {
+          api.ui.dialog.clear()
+          showProjectViewer(api)
+          return
+        }
+
+        if (option.value === STREAM_SHORTCUTS) return
+
+        if (option.value === ARCHIVED_STREAMS) {
+          api.ui.dialog.clear()
+          showArchivedStreamsViewer(api, project)
+          return
+        }
+
+        if (option.value === PROJECT_WORKLOG) {
+          clearStreamSelection()
+          selectProject(project.id)
+          api.ui.dialog.clear()
+          showSessionViewer(api, project)
+          return
+        }
+
+        if (option.value === NEW_STREAM) {
+          api.ui.dialog.clear()
+          showCreateStreamPrompt(api, project)
+          return
+        }
+
+        selectStream(project.id, option.value)
+        api.ui.dialog.clear()
+        showSessionViewer(api, project)
+      },
+    }),
+    () => clearModalShortcuts(),
+  )
+}
+
+function showCreateStreamPrompt(api, project) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: `New stream · ${project.name || project.id}`,
+      placeholder: "Stream name",
+      onConfirm(value) {
+        const name = value.trim()
+        if (!name) {
+          api.ui.toast({ variant: "error", title: "Stream name required", message: "Enter a stream name." })
+          return
+        }
+
+        try {
+          const stream = createIndexedStream(project, { name })
+          selectStream(project.id, stream.id)
+          api.ui.dialog.clear()
+          showSessionViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to create stream", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showStreamViewer(api, project)
+      },
+    }),
+  )
+}
+
+function sessionOptions(sessions, project) {
+  const directory = sessionDirectory(project)
+  return [
+    { title: "← Back to streams", value: BACK_STREAMS, category: "Navigation" },
+    { title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d delete", value: SESSION_SHORTCUTS, category: "Shortcuts" },
+    { title: "New session", value: NEW_SESSION, description: formatHomePath(directory), category: "Sessions" },
+    ...sessions.map((session) => ({
+      title: sessionTitle(session),
+      value: session.id,
+      description: sessionDescription(session),
+      category: sessionIndexEntry(project, session.id)?.pinned ? "Pinned" : sessionCategory(session),
+    })),
+  ]
+}
+
+function showSessionViewer(api, project) {
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: `Open workspace · Session · ${project.name || project.id}`,
+      placeholder: "Loading sessions...",
+      options: sessionOptions([], project),
+      async onSelect(option) {
+        await openSessionOption(api, project, option)
+      },
+    }),
+  )
+
+  listProjectRootSessions(api, project)
+    .then((sessions) => {
+      const options = sessionOptions(sessions, project)
+      const state = { kind: "sessions", project, sessions, selected: options[0] }
+      setModalShortcuts(api, state)
+      api.ui.dialog.replace(() =>
+        api.ui.DialogSelect({
+          title: `Open workspace · Session · ${project.name || project.id}`,
+          placeholder: "Search sessions...",
+          options,
+          current: api.route.current?.name === "session" ? api.route.current.params?.sessionID : rememberedSessionID(project, sessions),
+          onMove(option) {
+            state.selected = option
+          },
+          async onSelect(option) {
+            clearModalShortcuts()
+            await openSessionOption(api, project, option)
+          },
+        }),
+        () => clearModalShortcuts(),
+      )
+    })
+    .catch((error) => {
+      api.ui.dialog.clear()
+      showError(api, "Failed to list sessions", error)
+    })
+}
+
+function showRenameSessionPrompt(api, project, session) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "Rename session",
+      placeholder: sessionTitle(session),
+      value: sessionTitle(session),
+      async onConfirm(value) {
+        const title = value.trim()
+        if (!title) {
+          api.ui.toast({ variant: "error", title: "Session title required", message: "Enter a session title." })
+          return
+        }
+        try {
+          await api.client.session.update({ sessionID: session.id, title })
+          recordSession(currentSessionIndexTarget(project), session.id, { title })
+          api.ui.dialog.clear()
+          showSessionViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to rename session", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showSessionViewer(api, project)
+      },
+    }),
+  )
+}
+
+function showDeleteSessionConfirm(api, project, session) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: "Delete session permanently",
+      message: [
+        `Delete session "${sessionTitle(session)}" permanently?`,
+        "This deletes the opencode session and removes it from worklog stream indexes. It does not archive.",
+      ].join("\n"),
+      async onConfirm() {
+        try {
+          if (api.client.session.remove) await api.client.session.remove({ sessionID: session.id })
+          else await api.client.session.delete({ sessionID: session.id })
+          removeSessionRecord(project, session.id)
+          api.ui.dialog.clear()
+          showSessionViewer(api, project)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to delete session", error)
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showSessionViewer(api, project)
+      },
+    }),
+  )
+}
+
+async function openSessionOption(api, project, option) {
+  try {
+    if (option.value === BACK_STREAMS) {
+      api.ui.dialog.clear()
+      showStreamViewer(api, project)
+      return
+    }
+
+    if (option.value === SESSION_SHORTCUTS) return
+
+    if (option.value === NEW_SESSION) await createProjectSession(api, project)
+    else {
+      recordSession(currentSessionIndexTarget(project), option.value)
+      api.route.navigate("session", { sessionID: option.value })
+    }
+    preserveSessionContext(project)
+    api.ui.dialog.clear()
+  } catch (error) {
+    api.ui.dialog.clear()
+    showError(api, "Failed to open session", error)
+  }
+}
+
+function textLine(runtime, text, props = {}) {
+  const { createElement, insert, setProp } = runtime
+  const line = createElement("text")
+  if (props.fg) setProp(line, "fg", props.fg)
+  if (props.bold) setProp(line, "bold", true)
+  insert(line, text)
+  return line
+}
+
+function labelLine(runtime, label, value, theme) {
+  const { createElement, insert, setProp } = runtime
+  const line = createElement("text")
+  const key = createElement("span")
+  const text = createElement("span")
+  setProp(key, "style", { fg: theme.text, bold: true })
+  setProp(text, "style", { fg: theme.textMuted })
+  insert(key, `${label}: `)
+  insert(text, value)
+  insert(line, key)
+  insert(line, text)
+  return line
+}
+
+function sidebarContextView(api, runtime) {
+  const { createElement, insert, setProp } = runtime
+  const theme = api.theme.current
+  const labels = contextLabels(api)
+  const box = createElement("box")
+  setProp(box, "flexDirection", "column")
+  setProp(box, "gap", 0)
+  insert(box, labelLine(runtime, "Project", labels.project, theme))
+  insert(box, labelLine(runtime, "Stream", labels.stream, theme))
+  insert(box, labelLine(runtime, "Session", labels.session, theme))
+  insert(box, labelLine(runtime, "Workdir", labels.workdir, theme))
+  return box
+}
+
+function homeContextView(api, runtime) {
+  const { createElement, insert, setProp } = runtime
+  const theme = api.theme.current
+  const info = currentWorklogInfo(api)
+  const target = info.stream || info.project
+  const lastSessionID = target ? readSessionIndex(target).lastSessionID : undefined
+  const lastSession = lastSessionID ? api.state.session.get(lastSessionID) : undefined
+  const box = createElement("box")
+  setProp(box, "flexDirection", "column")
+  setProp(box, "gap", 0)
+  setProp(box, "marginTop", 1)
+  insert(box, textLine(runtime, "Worklog Context", { fg: theme.textMuted, bold: true }))
+  insert(box, labelLine(runtime, "Project", info.project?.name || info.project?.id || info.id, theme))
+  insert(box, labelLine(runtime, "Stream", info.stream?.name || "Project worklog", theme))
+  insert(box, labelLine(runtime, "Workdir", formatHomePath(info.root), theme))
+  insert(box, labelLine(runtime, "Last Session", lastSession ? sessionTitle(lastSession) : lastSessionID || "None", theme))
+  return box
+}
+
+async function registerSidebarContext(api) {
+  if (!api.slots?.register) return
+  const runtime = await ensureSolidRuntime()
+  api.slots.register({
+    order: 80,
+    slots: {
+      sidebar_content() {
+        return sidebarContextView(api, runtime)
+      },
+      home_bottom() {
+        return homeContextView(api, runtime)
+      },
+    },
+  })
+}
+
+export async function tui(api) {
+  await registerSidebarContext(api)
+
+  api.keymap.registerLayer({
+    commands: [
+      {
+        name: "worklog.workspace.open",
+        title: "Open workspace",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          showProjectViewer(api)
+        },
+      },
+      {
+        name: "worklog.worklog.view",
+        title: "View worklog",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          showWorklogViewer(api)
+        },
+      },
+      {
+        name: "worklog.context.view",
+        title: "Worklog context",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          showWorklogContext(api)
+        },
+      },
+    ],
+    bindings: api.tuiConfig.keybinds.gather("worklog", ["worklog.workspace.open", "worklog.worklog.view", "worklog.context.view"]),
+  })
+}
+
+export default {
+  id,
+  tui,
+}
