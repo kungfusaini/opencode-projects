@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { appendWorklogEntry, readAllEntries, WORKLOG_VERSION } from "./worklog.js"
 
 export const PLAN_VERSION = 1
+export const CURRENT_PLAN_VERSION = 1
 const RECENT_PLAN_ENTRY_COUNT = 8
 
 function slugify(input) {
@@ -55,6 +56,57 @@ function planSummary(plan) {
   return `${plan.status}: ${plan.title} (${plan.id})\n${plan.path}`
 }
 
+function formatCurrentRef(planRef) {
+  if (!planRef) return undefined
+  return {
+    v: CURRENT_PLAN_VERSION,
+    planID: planRef.id,
+    planPath: planRef.path,
+    status: planRef.status || "active",
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+export function getCurrentPlanRef(info) {
+  return readJson(currentPlanPath(info), undefined)
+}
+
+export function setCurrentPlanRef(info, plan) {
+  mkdirSync(ensurePlanDirs(info).root, { recursive: true })
+  const payload = formatCurrentRef(plan)
+  writeFileSync(currentPlanPath(info), `${JSON.stringify(payload, null, 2)}\n`, "utf8")
+  return payload
+}
+
+export function clearCurrentPlanRef(info) {
+  const file = currentPlanPath(info)
+  if (existsSync(file)) {
+    try {
+      unlinkSync(file)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+export function resolveCurrentPlan(info, status = "active") {
+  const ref = getCurrentPlanRef(info)
+  if (!ref || !ref.planPath) return undefined
+  const plans = listPlans(info, status === "all" ? "all" : status)
+  const current = plans.find((plan) => matchesCurrentPath(plan, ref))
+  if (!current) {
+    clearCurrentPlanRef(info)
+    return undefined
+  }
+  return current
+}
+
+export function setCurrentPlan(info, input) {
+  const plan = resolvePlan(info, input, "all")
+  setCurrentPlanRef(info, planRef(plan))
+  return plan
+}
+
 function readPlanAt(file, status) {
   const content = readFileSync(file, "utf8")
   const stats = statSync(file)
@@ -67,6 +119,27 @@ function readPlanAt(file, status) {
     updatedAt: stats.mtime.toISOString(),
     content,
   }
+}
+
+function readJson(file, fallback) {
+  if (!existsSync(file)) return fallback
+  try {
+    return JSON.parse(readFileSync(file, "utf8"))
+  } catch {
+    return fallback
+  }
+}
+
+function currentPlanPath(info) {
+  const dirs = ensurePlanDirs(info)
+  return path.join(dirs.root, "current.json")
+}
+
+function matchesCurrentPath(plan, ref) {
+  if (!ref) return false
+  if (typeof ref.planPath === "string" && plan.path === ref.planPath) return true
+  if (typeof ref.planID === "string" && plan.id === stripMarkdownExtension(ref.planID)) return true
+  return false
 }
 
 function listDirPlans(dir, status) {
@@ -196,6 +269,10 @@ export function archivePlan(info, input = {}) {
   writeFileSync(plan.path, `${archivedContent.trimEnd()}${completionNotes}`, "utf8")
   renameSync(plan.path, archivePath)
   const archivedPlan = readPlanAt(archivePath, "archive")
+  const ref = getCurrentPlanRef(info)
+  if (ref && matchesCurrentPath(plan, ref)) {
+    clearCurrentPlanRef(info)
+  }
   appendPlanEntry(info, "finish", `Archived completed plan: ${archivedPlan.title}`, archivedPlan, {
     result: input.result,
     files: [archivePath],
@@ -226,6 +303,8 @@ function compactPlanEntry(entry) {
 
 export function planWorkflowContext(info) {
   const active = listPlans(info, "active")
+  const current = resolveCurrentPlan(info, "all")
+  const currentLine = current ? `${current.title} (${current.id})\n  ${current.path}` : "none"
   const lines = [
     "Project plan workflow is available through the opencode-worklog plugin.",
     `Plan storage: ${path.join(info.dir, "plans")}`,
@@ -238,6 +317,7 @@ export function planWorkflowContext(info) {
     "- Do not edit the plan just to mark checklist progress.",
     "- Only update the plan when the intended approach, scope, constraints, risks, or completion criteria change.",
     "",
+    `Current plan: ${currentLine}`,
     "Active plans:",
     active.length ? active.map((plan) => `- ${plan.title} (${plan.id})\n  ${plan.path}`).join("\n") : "- none",
   ]
@@ -252,7 +332,13 @@ export function planWorkflowContext(info) {
   return lines.join("\n")
 }
 
-export function formatPlanList(plans) {
+export function formatPlanList(info, plans) {
   if (!plans.length) return "No plans found."
-  return plans.map(planSummary).join("\n\n")
+  const current = resolveCurrentPlan(info, "all")
+  return plans
+    .map((plan) => {
+      const currentMarker = current && plan.id === current.id ? " [current]" : ""
+      return `${planSummary(plan)}${currentMarker}`
+    })
+    .join("\n\n")
 }

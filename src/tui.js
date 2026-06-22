@@ -4,7 +4,6 @@ import path from "node:path"
 import {
   archiveProject,
   archiveStream,
-  clearStreamSelection,
   createIndexedStream,
   deleteArchivedProject,
   deleteArchivedStream,
@@ -12,20 +11,20 @@ import {
   listArchivedProjects,
   listProjects,
   listStreams,
-  readSelection,
   readStream,
   renameProject,
   renameStream,
   restoreProject,
   restoreStream,
-  selectProject,
-  selectStream,
   setProjectPinned,
   setStreamPinned,
   resolveContext,
   resolveProject,
+  resolveSessionOwner,
 } from "./projects.js"
+import { listPlans, resolveCurrentPlan } from "./plans.js"
 import { ensureStore, readAllEntries } from "./worklog.js"
+import { createSignal } from "solid-js"
 
 export const id = "opencode-worklog-tui"
 
@@ -42,9 +41,42 @@ const ARCHIVED_STREAMS = "__archived_streams__"
 const STREAM_SHORTCUTS = "__stream_shortcuts__"
 const ARCHIVED_STREAM_SHORTCUTS = "__archived_stream_shortcuts__"
 const SESSION_SHORTCUTS = "__session_shortcuts__"
+const BACK_PLANS = "__back_plans__"
+const PLAN_SHORTCUTS = "__plan_shortcuts__"
 
 let solidRuntime
 let modalShortcuts
+let sidebarVersion
+let sidebarRefresh
+const localSelection = { projectID: undefined, streamID: undefined }
+const trackedToolCalls = new Map()
+const sidebarRefreshTools = new Set(["plan_current", "plan_create", "plan_archive"])
+
+function currentSelection() {
+  return { ...localSelection }
+}
+
+function refreshSidebar(api) {
+  if (sidebarRefresh) sidebarRefresh((value) => value + 1)
+  api?.renderer?.requestRender?.()
+}
+
+function selectLocalProject(api, projectID) {
+  localSelection.projectID = projectID
+  localSelection.streamID = undefined
+  refreshSidebar(api)
+}
+
+function selectLocalStream(api, projectID, streamID) {
+  localSelection.projectID = projectID
+  localSelection.streamID = streamID
+  refreshSidebar(api)
+}
+
+function clearLocalStreamSelection(api) {
+  localSelection.streamID = undefined
+  refreshSidebar(api)
+}
 
 async function ensureSolidRuntime() {
   if (!solidRuntime) solidRuntime = await import("@opentui/solid")
@@ -52,22 +84,23 @@ async function ensureSolidRuntime() {
 }
 
 function selectedProject() {
-  const selection = readSelection()
+  const selection = currentSelection()
   return selection.projectID ? hydrateProject(selection.projectID) : undefined
 }
 
 function activeProject(api) {
+  if (api.route.current?.name === "session") return currentWorklogInfo(api).project
   return selectedProject() || resolveProject(api.state.path.directory)
 }
 
 function activeStream(project) {
-  const selection = readSelection()
+  const selection = currentSelection()
   return selection.projectID === project.id && selection.streamID ? readStream(project, selection.streamID) : undefined
 }
 
 function contextLabels(api) {
   const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
-  const info = resolveContext(api.state.path.directory, { sessionID })
+  const info = currentWorklogInfo(api)
   const project = info.project
   const stream = info.stream
   const session = sessionID ? api.state.session.get(sessionID) : undefined
@@ -79,9 +112,38 @@ function contextLabels(api) {
   }
 }
 
+function localContextInfo(api) {
+  const selection = currentSelection()
+  const selectedProject = selection.projectID ? hydrateProject(selection.projectID) : undefined
+  const project = selectedProject || resolveProject(api.state.path.directory)
+  const stream = selection.streamID && selection.projectID === project.id ? readStream(project, selection.streamID) : undefined
+  if (stream) {
+    return ensureStore({
+      scope: "stream",
+      project,
+      stream,
+      id: `${project.id}/${stream.id}`,
+      root: stream.workspace?.path || project.root,
+      dir: stream.dir,
+      log: stream.worklog,
+      plans: path.join(stream.dir, "plans"),
+    })
+  }
+  return ensureStore({
+    scope: "project",
+    project,
+    id: project.id,
+    root: project.root,
+    dir: project.dir,
+    log: project.worklog,
+    plans: path.join(project.dir, "plans"),
+  })
+}
+
 function currentWorklogInfo(api) {
   const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
-  return resolveContext(api.state.path.directory, { sessionID })
+  if (sessionID) return ensureStore(resolveContext(api.state.path.directory, { sessionID }))
+  return localContextInfo(api)
 }
 
 function formatHomePath(value) {
@@ -116,6 +178,114 @@ function sessionTitle(session) {
 
 function sessionDescription() {
   return undefined
+}
+
+function currentPlanSummary(info) {
+  const current = resolveCurrentPlan(info, "all")
+  return current ? `${current.title} (${current.id})` : "none"
+}
+
+function readPlanContent(planPath) {
+  if (!planPath) return undefined
+  return readFileSync(planPath, "utf8")
+}
+
+function showPlanContentDialog(api, plan) {
+  if (!plan) {
+    api.ui.toast({ variant: "error", title: "Plan not found", message: "No plan selected." })
+    return
+  }
+
+  let content
+  try {
+    content = readPlanContent(plan.path)
+  } catch (error) {
+    showError(api, "Failed to read plan", error)
+    return
+  }
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogConfirm({
+      title: `${plan.title} (${plan.id})`,
+      message: [
+        `Path: ${formatHomePath(plan.path)}`,
+        "",
+        content,
+      ].join("\n"),
+      onConfirm() {
+        api.ui.dialog.clear()
+        showPlanViewer(api)
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showPlanViewer(api)
+      },
+    }),
+  )
+}
+
+function showCurrentPlan(api) {
+  const info = currentWorklogInfo(api)
+  const plan = resolveCurrentPlan(info, "all")
+  if (!plan) {
+    api.ui.toast({ variant: "warning", title: "No current plan", message: "Set one with plan_current set." })
+    return
+  }
+  api.ui.dialog.clear()
+  showPlanContentDialog(api, plan)
+}
+
+function showPlanViewer(api) {
+  const info = currentWorklogInfo(api)
+  const plans = listPlans(info, "active")
+  if (!plans.length) {
+    api.ui.toast({ variant: "info", title: "No plans", message: "No active plans for this scope." })
+    return
+  }
+
+  const current = resolveCurrentPlan(info, "all")
+  const options = plans.map((plan) => {
+    const isCurrent = current && plan.id === current.id
+    return {
+      title: isCurrent ? `${plan.title} (${plan.id}) [current]` : `${plan.title} (${plan.id})`,
+      value: plan.path,
+      description: `Updated: ${plan.updatedAt}`,
+      category: "Plans",
+    }
+  })
+
+  const state = {
+    kind: "plans",
+    plans,
+    selected: options[0],
+  }
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: `Plans · ${info.stream?.name || "Project worklog"}`,
+      placeholder: plans.length ? "Search plans..." : "No plans",
+      options: [
+        { title: "← Back", value: BACK_PLANS, category: "Navigation" },
+        { title: "Press Enter to view", value: PLAN_SHORTCUTS, category: "Shortcuts" },
+        ...options,
+      ],
+      onMove(option) {
+        state.selected = option
+      },
+      onSelect(option) {
+        if (option.value === BACK_PLANS) {
+          api.ui.dialog.clear()
+          return
+        }
+        if (option.value === PLAN_SHORTCUTS) return
+        const plan = plans.find((item) => item.path === option.value)
+        api.ui.dialog.clear()
+        showPlanContentDialog(api, plan)
+      },
+    }),
+  )
 }
 
 function dateCategory(timestamp) {
@@ -270,7 +440,7 @@ function showWorklogEntry(api, info, entries, entry) {
 
 function showWorklogContext(api) {
   const sessionID = api.route.current?.name === "session" ? api.route.current.params?.sessionID : undefined
-  const info = ensureStore(resolveContext(api.state.path.directory, { sessionID }))
+  const info = currentWorklogInfo(api)
   const sessionSource = sessionID && info.stream ? "stream session index" : info.stream ? "selected stream" : "project"
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() =>
@@ -489,14 +659,22 @@ function sessionStream(project) {
   return activeStream(project)
 }
 
-function sessionDirectory(project) {
-  return project.root
+function sessionDirectory(project, stream) {
+  const workspacePath = stream?.workspace?.path || project.root
+  return path.resolve(workspacePath)
 }
 
-function preserveSessionContext(project) {
+function preserveSessionContext(api, project) {
   const stream = sessionStream(project)
-  if (stream) selectStream(project.id, stream.id)
-  else selectProject(project.id)
+  if (stream) selectLocalStream(api, project.id, stream.id)
+  else selectLocalProject(api, project.id)
+}
+
+function followSessionOwner(api, owner) {
+  if (!owner?.project) return false
+  if (owner.scope === "stream" && owner.stream) selectLocalStream(api, owner.project.id, owner.stream.id)
+  else selectLocalProject(api, owner.project.id)
+  return true
 }
 
 function readJson(file, fallback) {
@@ -599,21 +777,27 @@ function projectStreamSessionIDs(project) {
 }
 
 async function listProjectRootSessions(api, project, limit = 100) {
-  const directory = sessionDirectory(project)
+  const stream = sessionStream(project)
+  const directory = sessionDirectory(project, stream)
   if (!directory) throw new Error(`Project ${project.id} has no session directory`)
+  const indexTarget = stream ? readStreamSessionIndex(stream) : readSessionIndex(project)
+  const indexedSessionIDs = new Set(Object.keys(indexTarget.sessions))
+
+  if (!indexedSessionIDs.size) return []
+
   const result = await api.client.session.list({
     directory,
     scope: "project",
     roots: true,
     limit,
   })
-  const stream = sessionStream(project)
-  const streamSessionIDs = stream ? new Set(Object.keys(readStreamSessionIndex(stream).sessions)) : undefined
+
   const projectAssignedStreamSessionIDs = stream ? undefined : projectStreamSessionIDs(project)
   const sessions = (result.data ?? [])
     .filter((session) => !session.parentID)
-    .filter((session) => !streamSessionIDs || streamSessionIDs.has(session.id))
+    .filter((session) => indexedSessionIDs.has(session.id))
     .filter((session) => !projectAssignedStreamSessionIDs || !projectAssignedStreamSessionIDs.has(session.id))
+
   return sessions.toSorted((a, b) => {
     const aPinned = Boolean(sessionIndexEntry(project, a.id)?.pinned)
     const bPinned = Boolean(sessionIndexEntry(project, b.id)?.pinned)
@@ -623,7 +807,7 @@ async function listProjectRootSessions(api, project, limit = 100) {
 }
 
 async function createProjectSession(api, project) {
-  const directory = sessionDirectory(project)
+  const directory = sessionDirectory(project, sessionStream(project))
   if (!directory) throw new Error(`Project ${project.id} has no session directory`)
   const sessionID = (await api.client.session.create({ directory })).data?.id
   if (!sessionID) throw new Error("No session id returned")
@@ -634,7 +818,7 @@ async function createProjectSession(api, project) {
 
 function showProjectViewer(api, currentProjectID) {
   const currentProject = resolveProject(api.state.path.directory)
-  const selection = readSelection()
+  const selection = currentSelection()
   const projects = listProjects()
   const options = [
     {
@@ -690,7 +874,7 @@ function showProjectViewer(api, currentProjectID) {
         if (option.value === PROJECT_SHORTCUTS) return
 
         const project = listProjects().find((item) => item.id === option.value) || currentProject
-        selectProject(project.id)
+        selectLocalProject(api, project.id)
         api.ui.dialog.clear()
         showStreamViewer(api, project)
       },
@@ -733,8 +917,8 @@ function showArchiveProjectConfirm(api, project) {
       onConfirm() {
         try {
           archiveProject(project.id)
-          const selection = readSelection()
-          if (selection.projectID === project.id) clearStreamSelection()
+          const selection = currentSelection()
+          if (selection.projectID === project.id) clearLocalStreamSelection(api)
           api.ui.dialog.clear()
           showProjectViewer(api)
         } catch (error) {
@@ -945,7 +1129,7 @@ function showDeleteArchivedStreamConfirm(api, project, stream) {
 }
 
 function showStreamViewer(api, project) {
-  const selection = readSelection()
+  const selection = currentSelection()
   const streams = listStreams(project, "active")
   const options = [
     { title: "← Back to projects", value: BACK_PROJECTS, category: "Navigation" },
@@ -990,8 +1174,8 @@ function showStreamViewer(api, project) {
         }
 
         if (option.value === PROJECT_WORKLOG) {
-          clearStreamSelection()
-          selectProject(project.id)
+          clearLocalStreamSelection(api)
+          selectLocalProject(api, project.id)
           api.ui.dialog.clear()
           showSessionViewer(api, project)
           return
@@ -1003,7 +1187,7 @@ function showStreamViewer(api, project) {
           return
         }
 
-        selectStream(project.id, option.value)
+        selectLocalStream(api, project.id, option.value)
         api.ui.dialog.clear()
         showSessionViewer(api, project)
       },
@@ -1027,7 +1211,7 @@ function showCreateStreamPrompt(api, project) {
 
         try {
           const stream = createIndexedStream(project, { name })
-          selectStream(project.id, stream.id)
+          selectLocalStream(api, project.id, stream.id)
           api.ui.dialog.clear()
           showSessionViewer(api, project)
         } catch (error) {
@@ -1044,7 +1228,7 @@ function showCreateStreamPrompt(api, project) {
 }
 
 function sessionOptions(sessions, project) {
-  const directory = sessionDirectory(project)
+  const directory = sessionDirectory(project, sessionStream(project))
   return [
     { title: "← Back to streams", value: BACK_STREAMS, category: "Navigation" },
     { title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d delete", value: SESSION_SHORTCUTS, category: "Shortcuts" },
@@ -1169,12 +1353,18 @@ async function openSessionOption(api, project, option) {
 
     if (option.value === SESSION_SHORTCUTS) return
 
-    if (option.value === NEW_SESSION) await createProjectSession(api, project)
-    else {
-      recordSession(currentSessionIndexTarget(project), option.value)
+    if (option.value === NEW_SESSION) {
+      await createProjectSession(api, project)
+      preserveSessionContext(api, project)
+    } else {
+      const owner = resolveSessionOwner(option.value)
+      if (owner) followSessionOwner(api, owner)
+      else {
+        recordSession(currentSessionIndexTarget(project), option.value)
+        preserveSessionContext(api, project)
+      }
       api.route.navigate("session", { sessionID: option.value })
     }
-    preserveSessionContext(project)
     api.ui.dialog.clear()
   } catch (error) {
     api.ui.dialog.clear()
@@ -1206,14 +1396,17 @@ function labelLine(runtime, label, value, theme) {
 }
 
 function sidebarContextView(api, runtime) {
+  sidebarVersion?.()
   const { createElement, insert, setProp } = runtime
   const theme = api.theme.current
   const labels = contextLabels(api)
+  const info = currentWorklogInfo(api)
   const box = createElement("box")
   setProp(box, "flexDirection", "column")
   setProp(box, "gap", 0)
   insert(box, labelLine(runtime, "Project", labels.project, theme))
   insert(box, labelLine(runtime, "Stream", labels.stream, theme))
+  insert(box, labelLine(runtime, "Current plan", currentPlanSummary(info), theme))
   insert(box, labelLine(runtime, "Session", labels.session, theme))
   insert(box, labelLine(runtime, "Workdir", labels.workdir, theme))
   return box
@@ -1233,6 +1426,7 @@ function homeContextView(api, runtime) {
   insert(box, textLine(runtime, "Worklog Context", { fg: theme.textMuted, bold: true }))
   insert(box, labelLine(runtime, "Project", info.project?.name || info.project?.id || info.id, theme))
   insert(box, labelLine(runtime, "Stream", info.stream?.name || "Project worklog", theme))
+  insert(box, labelLine(runtime, "Current plan", currentPlanSummary(info), theme))
   insert(box, labelLine(runtime, "Workdir", formatHomePath(info.root), theme))
   insert(box, labelLine(runtime, "Last Session", lastSession ? sessionTitle(lastSession) : lastSessionID || "None", theme))
   return box
@@ -1241,6 +1435,9 @@ function homeContextView(api, runtime) {
 async function registerSidebarContext(api) {
   if (!api.slots?.register) return
   const runtime = await ensureSolidRuntime()
+  const [getSidebarVersion, setSidebarVersion] = createSignal(0)
+  sidebarVersion = getSidebarVersion
+  sidebarRefresh = setSidebarVersion
   api.slots.register({
     order: 80,
     slots: {
@@ -1254,8 +1451,30 @@ async function registerSidebarContext(api) {
   })
 }
 
+function registerSidebarRefreshEvents(api) {
+  const disposers = []
+  if (api.event?.on) {
+    disposers.push(api.event.on("session.next.tool.called", (event) => {
+      const tool = event.properties?.tool
+      if (sidebarRefreshTools.has(tool)) trackedToolCalls.set(event.properties.callID, tool)
+    }))
+    disposers.push(api.event.on("session.next.tool.success", (event) => {
+      if (!trackedToolCalls.has(event.properties?.callID)) return
+      trackedToolCalls.delete(event.properties.callID)
+      refreshSidebar(api)
+    }))
+    disposers.push(api.event.on("session.next.tool.failed", (event) => {
+      trackedToolCalls.delete(event.properties?.callID)
+    }))
+  }
+  api.lifecycle?.onDispose?.(() => {
+    for (const dispose of disposers) dispose?.()
+  })
+}
+
 export async function tui(api) {
   await registerSidebarContext(api)
+  registerSidebarRefreshEvents(api)
 
   api.keymap.registerLayer({
     commands: [
@@ -1266,6 +1485,26 @@ export async function tui(api) {
         namespace: "palette",
         run() {
           showProjectViewer(api)
+        },
+      },
+      {
+        name: "worklog.stream.open",
+        title: "Open streams",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          const project = activeProject(api)
+          showStreamViewer(api, project)
+        },
+      },
+      {
+        name: "worklog.session.open",
+        title: "Open sessions",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          const project = activeProject(api)
+          showSessionViewer(api, project)
         },
       },
       {
@@ -1286,8 +1525,34 @@ export async function tui(api) {
           showWorklogContext(api)
         },
       },
+      {
+        name: "worklog.plans.view",
+        title: "View plans",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          showPlanViewer(api)
+        },
+      },
+      {
+        name: "worklog.plans.current",
+        title: "View current plan",
+        category: "Worklog",
+        namespace: "palette",
+        run() {
+          showCurrentPlan(api)
+        },
+      },
     ],
-    bindings: api.tuiConfig.keybinds.gather("worklog", ["worklog.workspace.open", "worklog.worklog.view", "worklog.context.view"]),
+    bindings: api.tuiConfig.keybinds.gather("worklog", [
+      "worklog.workspace.open",
+      "worklog.stream.open",
+      "worklog.session.open",
+      "worklog.worklog.view",
+      "worklog.context.view",
+      "worklog.plans.view",
+      "worklog.plans.current",
+    ]),
   })
 }
 

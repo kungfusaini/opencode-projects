@@ -158,15 +158,20 @@ export function worklogReminder(info) {
   if (info.scope === "stream" && info.stream) {
     return [
       `Worklog tracking is enabled for selected stream: ${project} / ${info.stream.name || info.stream.id}.`,
-      `Use only this selected stream worklog for continuity unless the user explicitly asks for another stream or project-wide history: ${info.log}`,
-      "Do not read sibling stream worklogs or the parent project worklog by default.",
+      `Use this selected stream worklog as the default continuity source: ${info.log}`,
+      "Do not read sibling stream worklogs, the parent project worklog, or other project worklogs by default.",
+      "If the user explicitly asks for another stream, the parent project, project-wide history, another project, or another session's worklog, you may read those worklog files using normal tools.",
       "For meaningful progress, decisions, blockers, mistakes, finishes, or next steps, append a concise entry with worklog_append; it writes to the selected stream.",
+      "Stream start, finish, and mistake entries automatically roll up to the parent project log.",
+      "Set projectImpact=true when a decision, blocker, progress update, note, or next step affects project-level direction, architecture, release state, workflow, or future agents and should be visible in project memory.",
+      "Decision entries require reason, mistake entries require lesson, and stuck entries require blocker.",
     ].join(" ")
   }
   return [
     `Worklog tracking is enabled for project: ${project}.`,
-    `Use only this project worklog for continuity unless the user explicitly asks for stream-specific history: ${info.log}`,
-    "Do not read stream worklogs by default from project scope.",
+    `Use this project worklog as the default continuity source: ${info.log}`,
+    "Do not read stream worklogs or other project worklogs by default from project scope.",
+    "If the user explicitly asks for stream-specific history, another project, or another session's worklog, you may read those worklog files using normal tools.",
     "For meaningful progress, decisions, blockers, mistakes, finishes, or next steps, append a concise entry with worklog_append.",
   ].join(" ")
 }

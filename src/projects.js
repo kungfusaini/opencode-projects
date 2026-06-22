@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { projectInfo } from "./worklog.js"
@@ -157,6 +157,16 @@ export function resolveProject(workdir) {
   return ensureProject(cwd)
 }
 
+function discoverProjectStreams(project) {
+  const root = path.join(project.dir, "streams")
+  if (!existsSync(root)) return []
+
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => readStream(project, entry.name))
+    .filter(Boolean)
+}
+
 export function resolveStreamByWorkdir(workdir) {
   const cwd = path.resolve(workdir)
   const projects = Object.values(readRegistry().projects).filter((project) => (project.status || "active") === "active")
@@ -177,16 +187,46 @@ export function resolveStreamByWorkdir(workdir) {
   return best.length === 1 ? best[0] : undefined
 }
 
-export function resolveStreamBySession(sessionID) {
+function sessionIndexPath(target) {
+  return path.join(target.dir, "sessions.json")
+}
+
+function readSessionIndex(target) {
+  const index = readJson(sessionIndexPath(target), { v: 1, sessions: {} })
+  return {
+    v: index.v || 1,
+    lastSessionID: typeof index.lastSessionID === "string" ? index.lastSessionID : undefined,
+    sessions: index.sessions && typeof index.sessions === "object" ? index.sessions : {},
+  }
+}
+
+function newerSessionOwner(a, b) {
+  if (!a) return b
+  const aTime = String(a.entry?.updatedAt || a.entry?.createdAt || "")
+  const bTime = String(b.entry?.updatedAt || b.entry?.createdAt || "")
+  return bTime.localeCompare(aTime) > 0 ? b : a
+}
+
+export function resolveSessionOwner(sessionID) {
   if (!sessionID) return undefined
   const projects = Object.values(readRegistry().projects).filter((project) => (project.status || "active") === "active")
+  let owner
   for (const record of projects) {
     const project = hydrateProject(record.id) || record
-    for (const stream of listStreams(project, "active")) {
-      const index = readJson(path.join(stream.dir, "sessions.json"), { sessions: {} })
-      if (index.sessions && typeof index.sessions === "object" && index.sessions[sessionID]) return { project, stream }
+    const projectEntry = readSessionIndex(project).sessions[sessionID]
+    if (projectEntry) owner = newerSessionOwner(owner, { scope: "project", project, entry: projectEntry })
+
+    for (const stream of listStreams(project, "all")) {
+      const streamEntry = readSessionIndex(stream).sessions[sessionID]
+      if (streamEntry) owner = newerSessionOwner(owner, { scope: "stream", project, stream, entry: streamEntry })
     }
   }
+  return owner
+}
+
+export function resolveStreamBySession(sessionID) {
+  const owner = resolveSessionOwner(sessionID)
+  if (owner?.scope === "stream") return { project: owner.project, stream: owner.stream }
   return undefined
 }
 
@@ -302,9 +342,25 @@ export function createStream(project, input) {
 export function listStreams(project, status = "active") {
   const root = path.join(project.dir, "streams")
   if (!existsSync(root)) return []
-  return Object.keys(readJson(path.join(root, ".index.json"), {}))
+
+  const index = readJson(path.join(root, ".index.json"), {})
+  const indexed = Object.keys(index)
     .map((id) => readStream(project, id))
     .filter(Boolean)
+  const discovered = discoverProjectStreams(project)
+  const byID = new Map()
+
+  for (const stream of indexed) {
+    byID.set(stream.id, stream)
+  }
+
+  for (const stream of discovered) {
+    if (!byID.has(stream.id)) {
+      byID.set(stream.id, stream)
+    }
+  }
+
+  return [...byID.values()]
     .filter((stream) => status === "all" || stream.status === status)
     .sort((a, b) => {
       if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
@@ -390,24 +446,32 @@ export function clearStreamSelection() {
 }
 
 export function resolveContext(workdir, input = {}) {
-  const sessionMatched = resolveStreamBySession(input.sessionID)
-  if (sessionMatched?.stream) {
+  const sessionOwner = resolveSessionOwner(input.sessionID)
+  if (sessionOwner?.scope === "stream") {
     return {
       scope: "stream",
-      project: sessionMatched.project,
-      stream: sessionMatched.stream,
-      id: `${sessionMatched.project.id}/${sessionMatched.stream.id}`,
-      root: sessionMatched.stream.workspace?.path || sessionMatched.project.root,
-      dir: sessionMatched.stream.dir,
-      log: sessionMatched.stream.worklog,
-      plans: path.join(sessionMatched.stream.dir, "plans"),
+      project: sessionOwner.project,
+      stream: sessionOwner.stream,
+      id: `${sessionOwner.project.id}/${sessionOwner.stream.id}`,
+      root: sessionOwner.stream.workspace?.path || sessionOwner.project.root,
+      dir: sessionOwner.stream.dir,
+      log: sessionOwner.stream.worklog,
+      plans: path.join(sessionOwner.stream.dir, "plans"),
+    }
+  }
+  if (sessionOwner?.scope === "project") {
+    return {
+      scope: "project",
+      project: sessionOwner.project,
+      id: sessionOwner.project.id,
+      root: sessionOwner.project.root,
+      dir: sessionOwner.project.dir,
+      log: sessionOwner.project.worklog,
+      plans: path.join(sessionOwner.project.dir, "plans"),
     }
   }
 
-  const selection = readSelection()
-  const selectedProject = selection.projectID ? hydrateProject(selection.projectID) : undefined
-  const selectedStream = selection.streamID && selectedProject?.id === selection.projectID ? readStream(selectedProject, selection.streamID) : undefined
-  const matched = selectedStream ? { project: selectedProject, stream: selectedStream } : resolveStreamByWorkdir(workdir)
+  const matched = resolveStreamByWorkdir(workdir)
   if (matched?.stream) {
     return {
       scope: "stream",
@@ -420,7 +484,7 @@ export function resolveContext(workdir, input = {}) {
       plans: path.join(matched.stream.dir, "plans"),
     }
   }
-  const project = selectedProject || resolveProject(workdir)
+  const project = resolveProject(workdir)
   return {
     scope: "project",
     project,

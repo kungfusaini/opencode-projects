@@ -34,7 +34,7 @@
     "access": "public"
   },
   "scripts": {
-    "check": "node --check src/worklog.js && node --check src/plans.js && node --check src/projects.js && node --check src/index.js && node --check src/tui.js"
+    "check": "node --check src/plan-agent.js && node --check src/worklog.js && node --check src/plans.js && node --check src/projects.js && node --check src/index.js && node --check src/tui.js"
   },
   "dependencies": {
     "@opencode-ai/plugin": "latest",
