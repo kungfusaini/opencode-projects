@@ -101,10 +101,12 @@ To enable the workspace opener inside the opencode TUI, also add the TUI export 
 ```json
 {
   "plugin": [
-    "@kungfusaini/opencode-projects/tui"
+    "@kungfusaini/opencode-projects"
   ]
 }
 ```
+
+Use the package name in both config files. opencode's npm plugin loader resolves package entrypoints, not package subpath exports, so `@kungfusaini/opencode-projects/tui` is not a valid plugin config entry.
 
 This adds additive command palette actions under `OpenCode Projects` without overriding opencode's native session picker:
 

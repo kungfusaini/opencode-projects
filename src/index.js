@@ -25,6 +25,7 @@ import {
 } from "./worklog.js"
 import { resolveContext } from "./projects.js"
 import { DEFAULT_PLAN_AGENT } from "./plan-agent.js"
+import { tui } from "./tui.js"
 
 export const id = "opencode-projects"
 
@@ -506,4 +507,5 @@ export default {
   id,
   config,
   server,
+  tui,
 }
