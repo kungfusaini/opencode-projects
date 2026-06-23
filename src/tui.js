@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import {
@@ -7,6 +7,7 @@ import {
   createIndexedStream,
   deleteArchivedProject,
   deleteArchivedStream,
+  ensureProject,
   hydrateProject,
   listArchivedProjects,
   listProjects,
@@ -26,10 +27,14 @@ import { listPlans, resolveCurrentPlan } from "./plans.js"
 import { ensureStore, readAllEntries } from "./worklog.js"
 import { createSignal } from "solid-js"
 
-export const id = "opencode-worklog-tui"
+export const id = "opencode-projects-tui"
 
 const NEW_SESSION = "__new__"
+const NEW_PROJECT = "__new_project__"
 const NEW_STREAM = "__new_stream__"
+const USE_PROJECT_DIRECTORY = "__use_project_directory__"
+const TYPE_PROJECT_PATH = "__type_project_path__"
+const BACK_TO_PROJECT_PICKER = "__back_to_project_picker__"
 const PROJECT_WORKLOG = "__project__"
 const BACK_PROJECTS = "__back_projects__"
 const BACK_STREAMS = "__back_streams__"
@@ -154,9 +159,52 @@ function formatHomePath(value) {
   return value
 }
 
+function expandHomePath(value) {
+  const trimmed = String(value || "").trim()
+  if (!trimmed) return ""
+  if (trimmed === "~") return homedir()
+  if (trimmed.startsWith("~/")) return path.join(homedir(), trimmed.slice(2))
+  return trimmed
+}
+
+function projectNameFromPath(projectPath) {
+  return path.basename(path.resolve(projectPath)) || "Project"
+}
+
+function directoryOptions(currentPath) {
+  const directory = path.resolve(currentPath || homedir())
+  let children = []
+  try {
+    children = readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({
+        title: entry.name,
+        value: path.join(directory, entry.name),
+        description: formatHomePath(path.join(directory, entry.name)),
+        category: entry.name.startsWith(".") ? "Hidden directories" : "Directories",
+      }))
+      .sort((a, b) => {
+        const hidden = Number(a.title.startsWith(".")) - Number(b.title.startsWith("."))
+        if (hidden) return hidden
+        return a.title.localeCompare(b.title)
+      })
+  } catch {
+    children = []
+  }
+
+  return [
+    { title: "← Back to projects", value: BACK_TO_PROJECT_PICKER, category: "Navigation" },
+    { title: "Use this directory", value: USE_PROJECT_DIRECTORY, description: formatHomePath(directory), category: "Actions" },
+    { title: "Type path manually", value: TYPE_PROJECT_PATH, description: "Enter a path such as ~/matrix/web/argus", category: "Actions" },
+    { title: "..", value: path.dirname(directory), description: formatHomePath(path.dirname(directory)), category: "Navigation" },
+    ...children,
+  ]
+}
+
 function projectDescription(project, selected) {
   const bits = []
   if (selected) bits.push("selected")
+  if (project.pinned) bits.push("pinned")
   if (project.root) bits.push(formatHomePath(project.root))
   return bits.join(" · ")
 }
@@ -164,6 +212,7 @@ function projectDescription(project, selected) {
 function streamDescription(stream, selected) {
   const bits = []
   if (selected) bits.push("selected")
+  if (stream.pinned) bits.push("pinned")
   if (stream.purpose) bits.push(stream.purpose)
   if (stream.workspace?.mode) bits.push(stream.workspace.mode)
   return bits.join(" · ")
@@ -299,13 +348,32 @@ function sessionCategory(session) {
   return dateCategory(session.time?.updated)
 }
 
-function projectCategory(project) {
-  if (project.pinned) return "Pinned"
-  return dateCategory(project.updatedAt || project.createdAt)
+function newestSessionTimestamp(target) {
+  const sessions = Object.values(readSessionIndex(target).sessions)
+  return sessions.reduce((latest, session) => {
+    const timestamp = String(session?.updatedAt || session?.createdAt || "")
+    return timestamp.localeCompare(latest) > 0 ? timestamp : latest
+  }, "")
 }
 
-function streamCategory(stream) {
-  return dateCategory(stream.updatedAt || stream.createdAt)
+function projectActivityTimestamp(project) {
+  return [project, ...listStreams(project, "all")].reduce((latest, target) => {
+    const timestamp = newestSessionTimestamp(target)
+    return timestamp.localeCompare(latest) > 0 ? timestamp : latest
+  }, String(project.updatedAt || project.createdAt || ""))
+}
+
+function streamActivityTimestamp(stream) {
+  return newestSessionTimestamp(stream) || String(stream.updatedAt || stream.createdAt || "")
+}
+
+function compareActivity(a, b, activity) {
+  const byActivity = String(activity(b) || "").localeCompare(String(activity(a) || ""))
+  if (byActivity) return byActivity
+  if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
+  const byName = String(a.name || a.id).localeCompare(String(b.name || b.id))
+  if (byName) return byName
+  return String(a.id).localeCompare(String(b.id))
 }
 
 function worklogContext(api) {
@@ -373,7 +441,7 @@ function worklogOptions(info, entries) {
     {
       title: `${entries.length} entries · ${formatHomePath(info.log)}`,
       value: WORKLOG_INFO,
-      category: "Worklog",
+      category: "Info",
     },
     ...entries
       .map((entry, index) => ({ entry, index }))
@@ -445,7 +513,7 @@ function showWorklogContext(api) {
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() =>
     api.ui.DialogConfirm({
-      title: "Worklog context",
+      title: "Project context",
       message: [
         `Project: ${info.project?.name || info.project?.id || info.id}`,
         `Stream: ${info.stream?.name || "Project worklog"}`,
@@ -504,7 +572,7 @@ function runModalShortcut(api, action) {
 
 function selectedProjectFromState(state) {
   const value = state.selected?.value
-  if (!value || value === ARCHIVED_PROJECTS || value === BACK_PROJECTS || value === PROJECT_SHORTCUTS || value === ARCHIVE_SHORTCUTS) return undefined
+  if (!value || value === ARCHIVED_PROJECTS || value === BACK_PROJECTS || value === NEW_PROJECT || value === PROJECT_SHORTCUTS || value === ARCHIVE_SHORTCUTS) return undefined
   return state.projects.find((project) => project.id === value)
 }
 
@@ -816,10 +884,21 @@ async function createProjectSession(api, project) {
   return sessionID
 }
 
+async function createProjectSessionFromPalette(api) {
+  const project = activeProject(api)
+  try {
+    await createProjectSession(api, project)
+    preserveSessionContext(api, project)
+    api.ui.dialog.clear()
+  } catch (error) {
+    showError(api, "Failed to create session", error)
+  }
+}
+
 function showProjectViewer(api, currentProjectID) {
   const currentProject = resolveProject(api.state.path.directory)
   const selection = currentSelection()
-  const projects = listProjects()
+  const projects = listProjects().toSorted((a, b) => compareActivity(a, b, projectActivityTimestamp))
   const options = [
     {
       title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d archive",
@@ -827,11 +906,12 @@ function showProjectViewer(api, currentProjectID) {
       category: "Shortcuts",
     },
     { title: "Archived projects", value: ARCHIVED_PROJECTS, category: "Navigation" },
+    { title: "New project", value: NEW_PROJECT, description: "Create from a local path", category: "Projects" },
     ...projects.map((project) => ({
       title: project.name || project.id,
       value: project.id,
       description: projectDescription(project, selection.projectID === project.id),
-      category: projectCategory(project),
+      category: "Projects",
     })),
   ]
 
@@ -840,7 +920,7 @@ function showProjectViewer(api, currentProjectID) {
       title: currentProject.name || currentProject.id,
       value: currentProject.id,
       description: projectDescription(currentProject, selection.projectID === currentProject.id),
-      category: projectCategory(currentProject),
+      category: "Projects",
     })
   }
 
@@ -856,7 +936,7 @@ function showProjectViewer(api, currentProjectID) {
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
-      title: "Open workspace · Project",
+      title: "Open Projects · Project",
       placeholder: "Search projects...",
       options,
       current: currentProjectID || selection.projectID,
@@ -871,6 +951,12 @@ function showProjectViewer(api, currentProjectID) {
           return
         }
 
+        if (option.value === NEW_PROJECT) {
+          api.ui.dialog.clear()
+          showCreateProjectDirectoryPicker(api)
+          return
+        }
+
         if (option.value === PROJECT_SHORTCUTS) return
 
         const project = listProjects().find((item) => item.id === option.value) || currentProject
@@ -880,6 +966,88 @@ function showProjectViewer(api, currentProjectID) {
       },
     }),
     () => clearModalShortcuts(),
+  )
+}
+
+function createProjectFromPath(api, projectPath) {
+  if (!existsSync(projectPath)) throw new Error(`Path does not exist: ${formatHomePath(projectPath)}`)
+  if (!statSync(projectPath).isDirectory()) throw new Error(`Path is not a directory: ${formatHomePath(projectPath)}`)
+  const project = ensureProject(projectPath, { name: projectNameFromPath(projectPath) })
+  selectLocalProject(api, project.id)
+  api.ui.toast({ variant: "success", title: "Project created", message: project.name || project.id })
+  api.ui.dialog.clear()
+  showStreamViewer(api, project)
+}
+
+function showCreateProjectDirectoryPicker(api, currentPath = api.state.path.directory || homedir()) {
+  const directory = path.resolve(currentPath)
+  const options = directoryOptions(directory)
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: `New project · ${formatHomePath(directory)}`,
+      placeholder: "Search directories...",
+      options,
+      current: USE_PROJECT_DIRECTORY,
+      onSelect(option) {
+        if (option.value === BACK_TO_PROJECT_PICKER) {
+          api.ui.dialog.clear()
+          showProjectViewer(api)
+          return
+        }
+
+        if (option.value === TYPE_PROJECT_PATH) {
+          api.ui.dialog.clear()
+          showCreateProjectPrompt(api, directory)
+          return
+        }
+
+        if (option.value === USE_PROJECT_DIRECTORY) {
+          try {
+            createProjectFromPath(api, directory)
+          } catch (error) {
+            api.ui.dialog.clear()
+            showError(api, "Failed to create project", error)
+            showCreateProjectDirectoryPicker(api, directory)
+          }
+          return
+        }
+
+        api.ui.dialog.clear()
+        showCreateProjectDirectoryPicker(api, option.value)
+      },
+    }),
+  )
+}
+
+function showCreateProjectPrompt(api, currentPath = api.state.path.directory || homedir()) {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "New project",
+      placeholder: formatHomePath(currentPath) || "~/matrix/web/argus",
+      onConfirm(value) {
+        const rawPath = expandHomePath(value)
+        if (!rawPath) {
+          api.ui.toast({ variant: "error", title: "Project path required", message: "Enter a local directory path." })
+          return
+        }
+        const projectPath = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(currentPath, rawPath)
+
+        try {
+          createProjectFromPath(api, projectPath)
+        } catch (error) {
+          api.ui.dialog.clear()
+          showError(api, "Failed to create project", error)
+          showCreateProjectDirectoryPicker(api, path.dirname(projectPath))
+        }
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+        showCreateProjectDirectoryPicker(api, currentPath)
+      },
+    }),
   )
 }
 
@@ -1130,7 +1298,7 @@ function showDeleteArchivedStreamConfirm(api, project, stream) {
 
 function showStreamViewer(api, project) {
   const selection = currentSelection()
-  const streams = listStreams(project, "active")
+  const streams = listStreams(project, "active").toSorted((a, b) => compareActivity(a, b, streamActivityTimestamp))
   const options = [
     { title: "← Back to projects", value: BACK_PROJECTS, category: "Navigation" },
     { title: "ctrl+f pin/unpin · ctrl+r rename · ctrl+d archive", value: STREAM_SHORTCUTS, category: "Shortcuts" },
@@ -1141,7 +1309,7 @@ function showStreamViewer(api, project) {
       title: stream.name || stream.id,
       value: stream.id,
       description: streamDescription(stream, selection.streamID === stream.id),
-      category: stream.pinned ? "Pinned" : streamCategory(stream),
+      category: "Streams",
     })),
   ]
   const state = { kind: "streams", project, streams, selected: options[0] }
@@ -1150,7 +1318,7 @@ function showStreamViewer(api, project) {
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
-      title: `Open workspace · Stream · ${project.name || project.id}`,
+      title: `Open Projects · Stream · ${project.name || project.id}`,
       placeholder: "Search streams...",
       options,
       current: selection.streamID || PROJECT_WORKLOG,
@@ -1246,7 +1414,7 @@ function showSessionViewer(api, project) {
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
-      title: `Open workspace · Session · ${project.name || project.id}`,
+      title: `Open Projects · Session · ${project.name || project.id}`,
       placeholder: "Loading sessions...",
       options: sessionOptions([], project),
       async onSelect(option) {
@@ -1262,7 +1430,7 @@ function showSessionViewer(api, project) {
       setModalShortcuts(api, state)
       api.ui.dialog.replace(() =>
         api.ui.DialogSelect({
-          title: `Open workspace · Session · ${project.name || project.id}`,
+          title: `Open Projects · Session · ${project.name || project.id}`,
           placeholder: "Search sessions...",
           options,
           current: api.route.current?.name === "session" ? api.route.current.params?.sessionID : rememberedSessionID(project, sessions),
@@ -1423,7 +1591,7 @@ function homeContextView(api, runtime) {
   setProp(box, "flexDirection", "column")
   setProp(box, "gap", 0)
   setProp(box, "marginTop", 1)
-  insert(box, textLine(runtime, "Worklog Context", { fg: theme.textMuted, bold: true }))
+  insert(box, textLine(runtime, "Project Context", { fg: theme.textMuted, bold: true }))
   insert(box, labelLine(runtime, "Project", info.project?.name || info.project?.id || info.id, theme))
   insert(box, labelLine(runtime, "Stream", info.stream?.name || "Project worklog", theme))
   insert(box, labelLine(runtime, "Current plan", currentPlanSummary(info), theme))
@@ -1476,21 +1644,32 @@ export async function tui(api) {
   await registerSidebarContext(api)
   registerSidebarRefreshEvents(api)
 
+  const projectCommands = [
+    "projects.open",
+    "projects.stream.open",
+    "projects.session.open",
+    "projects.session.new",
+    "projects.worklog.view",
+    "projects.context.view",
+    "projects.plans.view",
+    "projects.plans.current",
+  ]
+
   api.keymap.registerLayer({
     commands: [
       {
-        name: "worklog.workspace.open",
-        title: "Open workspace",
-        category: "Worklog",
+        name: "projects.open",
+        title: "Open Projects",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           showProjectViewer(api)
         },
       },
       {
-        name: "worklog.stream.open",
-        title: "Open streams",
-        category: "Worklog",
+        name: "projects.stream.open",
+        title: "Open Streams",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           const project = activeProject(api)
@@ -1498,9 +1677,9 @@ export async function tui(api) {
         },
       },
       {
-        name: "worklog.session.open",
-        title: "Open sessions",
-        category: "Worklog",
+        name: "projects.session.open",
+        title: "Open Sessions",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           const project = activeProject(api)
@@ -1508,51 +1687,58 @@ export async function tui(api) {
         },
       },
       {
-        name: "worklog.worklog.view",
-        title: "View worklog",
-        category: "Worklog",
+        name: "projects.session.new",
+        title: "New Project Session",
+        category: "OpenCode Projects",
+        namespace: "palette",
+        run() {
+          createProjectSessionFromPalette(api)
+        },
+      },
+      {
+        name: "projects.worklog.view",
+        title: "View Worklog",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           showWorklogViewer(api)
         },
       },
       {
-        name: "worklog.context.view",
-        title: "Worklog context",
-        category: "Worklog",
+        name: "projects.context.view",
+        title: "Project Context",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           showWorklogContext(api)
         },
       },
       {
-        name: "worklog.plans.view",
-        title: "View plans",
-        category: "Worklog",
+        name: "projects.plans.view",
+        title: "View Plans",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           showPlanViewer(api)
         },
       },
       {
-        name: "worklog.plans.current",
-        title: "View current plan",
-        category: "Worklog",
+        name: "projects.plans.current",
+        title: "View Current Plan",
+        category: "OpenCode Projects",
         namespace: "palette",
         run() {
           showCurrentPlan(api)
         },
       },
     ],
-    bindings: api.tuiConfig.keybinds.gather("worklog", [
-      "worklog.workspace.open",
-      "worklog.stream.open",
-      "worklog.session.open",
-      "worklog.worklog.view",
-      "worklog.context.view",
-      "worklog.plans.view",
-      "worklog.plans.current",
-    ]),
+    bindings: [
+      ...api.tuiConfig.keybinds.gather("projects", projectCommands),
+      { key: "<leader>p", cmd: "projects.open" },
+      { key: "<leader>s", cmd: "projects.stream.open" },
+      { key: "<leader>l", cmd: "projects.session.open" },
+      { key: "<leader>n", cmd: "projects.session.new" },
+    ],
   })
 }
 

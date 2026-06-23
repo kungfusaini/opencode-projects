@@ -1,13 +1,13 @@
-# opencode-worklog
+# opencode-projects
 
-OpenCode server and TUI plugin for project worklog tracking, durable plan artifacts, and explicit streams.
+OpenCode server and TUI plugin for project contexts, explicit streams, durable plan artifacts, and worklog continuity.
 
 ## What it provides
 
 - `worklog_append` tool for concise project progress, decision, blocker, and finish entries.
 - Durable project plan tools: `plan_create`, `plan_current`, `plan_list`, `plan_read`, `plan_update`, and `plan_archive`.
 - Plan-aware context injection when the user asks to plan, resume, continue, execute, or archive a plan.
-- Additive TUI palette commands for opening registered projects, viewing worklogs, opening project-scoped sessions, creating project sessions, managing streams, and viewing plans.
+- Additive TUI palette commands under **OpenCode Projects** for opening registered projects, viewing worklogs, opening project-scoped sessions, creating project sessions, managing streams, and viewing plans.
 - A small reminder while tracking is enabled so the assistant appends meaningful updates and can read deeper history only when needed.
 
 ## Storage model
@@ -91,7 +91,7 @@ Add the package to global `~/.config/opencode/opencode.json`:
 ```json
 {
   "plugin": [
-    "@kungfusaini/opencode-worklog"
+    "@kungfusaini/opencode-projects"
   ]
 }
 ```
@@ -101,41 +101,47 @@ To enable the workspace opener inside the opencode TUI, also add the TUI export 
 ```json
 {
   "plugin": [
-    "@kungfusaini/opencode-worklog/tui"
+    "@kungfusaini/opencode-projects/tui"
   ]
 }
 ```
 
-This adds additive command palette actions under `Worklog` without overriding opencode's native session picker:
+This adds additive command palette actions under `OpenCode Projects` without overriding opencode's native session picker:
 
 ```text
-Open workspace
-Open streams
-Open sessions
-View worklog
-View plans
-View current plan
+Open Projects
+Open Streams
+Open Sessions
+New Project Session
+View Worklog
+Project Context
+View Plans
+View Current Plan
 ```
 
 Command names:
 
 ```text
-worklog.workspace.open
-worklog.stream.open
-worklog.session.open
-worklog.worklog.view
-worklog.plans.view
-worklog.plans.current
+projects.open
+projects.stream.open
+projects.session.open
+projects.session.new
+projects.worklog.view
+projects.context.view
+projects.plans.view
+projects.plans.current
 ```
 
 Current behavior:
 
-- `Open workspace` chains three simple viewers: project → stream → session.
-- `Open streams` opens the stream selector for the current project.
-- `Open sessions` opens the session selector for the current project/selected stream.
+- `Open Projects` opens a flat activity-sorted project selector.
+- `Open Streams` opens a flat activity-sorted stream selector for the current project.
+- `Open Sessions` opens the session selector for the current project/selected stream.
+- `New Project Session` creates a session associated with the current project or selected stream.
 - Session listing is index-driven: only sessions that are explicitly associated with the active project/stream are shown in the picker.
 - New projects and new streams start with no associated sessions, so their picker initially appears empty until you create a session from that picker.
-- The project viewer shows active projects, with pinned projects first and date grouping. Pressing enter opens the project; project management is shortcut-only (`ctrl+f` pin/unpin, `ctrl+r` rename, `ctrl+d` archive).
+- The project viewer shows active projects sorted by recent session activity, falling back to metadata timestamps. Pressing enter opens the project; project management is shortcut-only (`ctrl+f` pin/unpin, `ctrl+r` rename, `ctrl+d` archive).
+- `New project` opens a directory picker, with a manual path prompt as a fallback, then creates/selects the project and opens its stream viewer.
 - Archived projects are available from the project viewer. Archived projects can be restored with `ctrl+r` or permanently deleted with `ctrl+d`. Permanent delete removes local worklog data only; it does not delete the code repository.
 - The stream viewer selects `Project worklog`, creates a new stream, or selects an existing active stream.
 - The session viewer lists root sessions for the selected project and includes `New session`.

@@ -306,7 +306,7 @@ export function planWorkflowContext(info) {
   const current = resolveCurrentPlan(info, "all")
   const currentLine = current ? `${current.title} (${current.id})\n  ${current.path}` : "none"
   const lines = [
-    "Project plan workflow is available through the opencode-worklog plugin.",
+    "Project plan workflow is available through the opencode-projects plugin.",
     `Plan storage: ${path.join(info.dir, "plans")}`,
     "Plan model: plan = intended route; worklog = durable progress/events; todowrite = live session checklist.",
     "When working from an active plan:",

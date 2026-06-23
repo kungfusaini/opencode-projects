@@ -1,17 +1,17 @@
 {
-  "name": "@kungfusaini/opencode-worklog",
+  "name": "@kungfusaini/opencode-projects",
   "version": "0.2.0",
-  "description": "OpenCode server plugin for project worklog tracking, durable plans, and continuity orientation.",
+  "description": "OpenCode plugin for project contexts, streams, durable plans, and worklog continuity.",
   "type": "module",
   "license": "MIT",
   "author": "Sumeet Saini",
-  "homepage": "https://github.com/kungfusaini/opencode-worklog#readme",
+  "homepage": "https://github.com/kungfusaini/opencode-projects#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kungfusaini/opencode-worklog.git"
+    "url": "git+https://github.com/kungfusaini/opencode-projects.git"
   },
   "bugs": {
-    "url": "https://github.com/kungfusaini/opencode-worklog/issues"
+    "url": "https://github.com/kungfusaini/opencode-projects/issues"
   },
   "keywords": [
     "opencode",

@@ -26,7 +26,7 @@ import {
 import { resolveContext } from "./projects.js"
 import { DEFAULT_PLAN_AGENT } from "./plan-agent.js"
 
-export const id = "opencode-worklog"
+export const id = "opencode-projects"
 
 function applyPlanAgentOverrides(cfg) {
   cfg.agent = cfg.agent || {}

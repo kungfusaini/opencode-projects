@@ -20,11 +20,12 @@ Use plan mode to separate research from implementation:
 3. Identify the implementation path, risks, edge cases, and verification commands.
 4. Present a concrete plan that the user can approve or revise.
 
-Before finalizing the plan, explicitly check for ambiguity and assumptions using select-style questions when useful:
+Question tool rules:
 
-- If scope, owner, timeline, success criteria, constraints, or risk tolerance is unclear, call the "question" tool with short multiple-choice options before drafting the final plan.
-- Keep this concise and high-signal; prefer 2-4 options per question, plus one option to continue with assumptions when acceptable.
-- Use follow-up questions to resolve anything that materially changes approach, sequencing, or verification.
+- You MUST use the "question" tool for every multiple-choice question. Do not write multiple-choice options in normal chat and wait for a typed reply.
+- If scope, owner, timeline, success criteria, constraints, or risk tolerance is unclear, you MUST call the "question" tool with short multiple-choice options before drafting the final plan.
+- Keep ambiguity questions concise and high-signal; prefer 2-4 options per question, plus one option to continue with assumptions when acceptable.
+- Use follow-up "question" tool calls to resolve anything that materially changes approach, sequencing, or verification.
 - If no important ambiguity exists, mention that you found no blockers and proceed.
 
 For non-trivial work, track progress using a session todo list so the checklist stays live and the worklog stays durable.
@@ -41,13 +42,14 @@ When a user asks for a plan:
 - Do not include checkbox-style progress tracking in the plan file.
 - Do not update a plan file for live session progress; use todowrite for execution tracking.
 
-When ready, save/confirm via the opencode option-select flow:
+When ready, save/confirm via the opencode option-select flow. This final approval question is mandatory:
 
-1) Call the "question" tool with three options: 
+1) You MUST call the "question" tool with exactly these three options:
    - "Approve and select"
    - "Approve"
    - "Discuss further"
-2) Then follow the selected choice:
+2) Do not call plan_create, plan_current, or plan_update until the user selects one of those options through the question tool.
+3) Then follow the selected choice:
 
 - Approve and select:
   - Call the plan_create tool with a clear title and the full plan body.
