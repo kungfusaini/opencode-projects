@@ -1563,6 +1563,25 @@ function labelLine(runtime, label, value, theme) {
   return line
 }
 
+function worklogStatusLine(runtime, info, theme) {
+  const { createElement, insert, setProp } = runtime
+  const line = createElement("text")
+  const dot = createElement("span")
+  const name = createElement("span")
+  const status = createElement("span")
+  const loaded = Boolean(info?.log && existsSync(info.log))
+  setProp(dot, "style", { fg: loaded ? theme.success : theme.error })
+  setProp(name, "style", { fg: theme.textMuted, bold: true })
+  setProp(status, "style", { fg: theme.textMuted })
+  insert(dot, "•")
+  insert(name, " Worklog")
+  insert(status, loaded ? " loaded" : " unavailable")
+  insert(line, dot)
+  insert(line, name)
+  insert(line, status)
+  return line
+}
+
 function sidebarContextView(api, runtime) {
   sidebarVersion?.()
   const { createElement, insert, setProp } = runtime
@@ -1577,6 +1596,7 @@ function sidebarContextView(api, runtime) {
   insert(box, labelLine(runtime, "Current plan", currentPlanSummary(info), theme))
   insert(box, labelLine(runtime, "Session", labels.session, theme))
   insert(box, labelLine(runtime, "Workdir", labels.workdir, theme))
+  insert(box, worklogStatusLine(runtime, info, theme))
   return box
 }
 
