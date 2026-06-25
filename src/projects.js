@@ -391,8 +391,8 @@ export function setStreamPinned(project, id, pinned) {
   return updateStream(project, id, { pinned: Boolean(pinned) })
 }
 
-export function archiveStream(project, id) {
-  const stream = updateStream(project, id, { status: "archived", pinned: false, archivedAt: now() })
+export function archiveStream(project, id, patch = {}) {
+  const stream = updateStream(project, id, { ...patch, status: "archived", pinned: false, archivedAt: now() })
   const selection = readSelection()
   if (selection.projectID === project.id && selection.streamID === id) clearStreamSelection()
   return stream

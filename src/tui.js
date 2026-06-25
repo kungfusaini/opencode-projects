@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { execFile, execFileSync } from "node:child_process"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import {
@@ -19,6 +20,7 @@ import {
   restoreStream,
   setProjectPinned,
   setStreamPinned,
+  updateStream,
   resolveContext,
   resolveProject,
   resolveSessionOwner,
@@ -48,6 +50,8 @@ const ARCHIVED_STREAM_SHORTCUTS = "__archived_stream_shortcuts__"
 const SESSION_SHORTCUTS = "__session_shortcuts__"
 const BACK_PLANS = "__back_plans__"
 const PLAN_SHORTCUTS = "__plan_shortcuts__"
+const CREATE_SHARED_STREAM = "__create_shared_stream__"
+const CREATE_WORKTREE_STREAM = "__create_worktree_stream__"
 
 let solidRuntime
 let modalShortcuts
@@ -171,6 +175,136 @@ function projectNameFromPath(projectPath) {
   return path.basename(path.resolve(projectPath)) || "Project"
 }
 
+function slugifyPathPart(input) {
+  return String(input || "")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase()
+    .slice(0, 80) || "stream"
+}
+
+function runGit(cwd, args) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim()
+}
+
+function runGitAsync(cwd, args) {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = String(stderr || error.message || "").trim()
+        reject(new Error(detail || `git ${args.join(" ")} failed`))
+        return
+      }
+      resolve(String(stdout || "").trim())
+    })
+  })
+}
+
+function gitRepoInfo(workdir) {
+  try {
+    const directory = path.resolve(workdir)
+    const root = runGit(directory, ["rev-parse", "--show-toplevel"])
+    if (!root) return undefined
+    const commonDirRaw = runGit(root, ["rev-parse", "--git-common-dir"])
+    const commonDir = path.isAbsolute(commonDirRaw) ? commonDirRaw : path.resolve(root, commonDirRaw)
+    const branch = runGit(root, ["branch", "--show-current"]) || undefined
+    return { root, commonDir, branch }
+  } catch {
+    return undefined
+  }
+}
+
+function isGitProject(project) {
+  return Boolean(gitRepoInfo(project.root))
+}
+
+function gitBranchExists(repoRoot, branch) {
+  try {
+    runGit(repoRoot, ["show-ref", "--verify", `refs/heads/${branch}`])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function uniqueWorktreePath(repoRoot, slug) {
+  const base = path.join(repoRoot, ".worktrees", slug)
+  if (!existsSync(base)) return base
+  for (let index = 2; index < 1000; index++) {
+    const candidate = path.join(repoRoot, ".worktrees", `${slug}-${index}`)
+    if (!existsSync(candidate)) return candidate
+  }
+  throw new Error(`Could not find an available worktree path for ${slug}`)
+}
+
+function uniqueBranchName(repoRoot, slug) {
+  const base = `stream/${slug}`
+  if (!gitBranchExists(repoRoot, base)) return base
+  for (let index = 2; index < 1000; index++) {
+    const candidate = `${base}-${index}`
+    if (!gitBranchExists(repoRoot, candidate)) return candidate
+  }
+  throw new Error(`Could not find an available branch name for ${base}`)
+}
+
+function ensureWorktreesExcluded(commonDir) {
+  const excludePath = path.join(commonDir, "info", "exclude")
+  mkdirSync(path.dirname(excludePath), { recursive: true })
+  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : ""
+  if (existing.split(/\r?\n/).some((line) => line.trim() === ".worktrees/")) return
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : ""
+  appendFileSync(excludePath, `${prefix}.worktrees/\n`, "utf8")
+}
+
+function gitWorktreeWorkspaceForStream(project, name, mode = "pending-git-worktree") {
+  const repo = gitRepoInfo(project.root)
+  if (!repo) throw new Error("Project is not inside a git repository")
+  const slug = slugifyPathPart(name)
+  const worktreePath = uniqueWorktreePath(repo.root, slug)
+  const branch = uniqueBranchName(repo.root, slug)
+  const base = repo.branch || "HEAD"
+
+  return {
+    mode,
+    path: worktreePath,
+    branch,
+    base,
+    repoRoot: repo.root,
+    gitCommonDir: repo.commonDir,
+  }
+}
+
+async function createGitWorktree(workspace) {
+  const repoRoot = workspace.repoRoot || gitRepoInfo(path.dirname(workspace.path))?.root
+  const commonDir = workspace.gitCommonDir || (repoRoot ? gitRepoInfo(repoRoot)?.commonDir : undefined)
+  if (!repoRoot || !commonDir) throw new Error("Could not resolve git repository for worktree")
+  if (!workspace.path || !workspace.branch) throw new Error("Worktree path and branch are required")
+
+  mkdirSync(path.dirname(workspace.path), { recursive: true })
+  ensureWorktreesExcluded(commonDir)
+  await runGitAsync(repoRoot, ["worktree", "add", "-b", workspace.branch, workspace.path, workspace.base || "HEAD"])
+}
+
+function isPendingWorktreeStream(stream) {
+  return stream?.workspace?.mode === "pending-git-worktree"
+}
+
+function isGitWorktreeStream(stream) {
+  return stream?.workspace?.mode === "git-worktree"
+}
+
+async function removeGitWorktree(workspace) {
+  if (!workspace?.path) throw new Error("Worktree path is required")
+  const repoRoot = workspace.repoRoot || gitRepoInfo(path.dirname(workspace.path))?.root
+  if (!repoRoot) throw new Error("Could not resolve git repository for worktree")
+  await runGitAsync(repoRoot, ["worktree", "remove", workspace.path])
+}
+
 function directoryOptions(currentPath) {
   const directory = path.resolve(currentPath || homedir())
   let children = []
@@ -215,6 +349,8 @@ function streamDescription(stream, selected) {
   if (stream.pinned) bits.push("pinned")
   if (stream.purpose) bits.push(stream.purpose)
   if (stream.workspace?.mode) bits.push(stream.workspace.mode)
+  if (stream.workspace?.branch) bits.push(stream.workspace.branch)
+  if (["git-worktree", "pending-git-worktree"].includes(stream.workspace?.mode) && stream.workspace?.path) bits.push(formatHomePath(stream.workspace.path))
   return bits.join(" · ")
 }
 
@@ -521,9 +657,10 @@ function showWorklogContext(api) {
         `Scope: ${info.scope}`,
         `Source: ${sessionSource}`,
         `Workdir: ${formatHomePath(info.root)}`,
+        ["git-worktree", "pending-git-worktree"].includes(info.stream?.workspace?.mode) ? `Branch: ${info.stream.workspace.branch || "unknown"}` : undefined,
         `Worklog: ${formatHomePath(info.log)}`,
         `Plans: ${formatHomePath(info.plans)}`,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       onConfirm() {
         api.ui.dialog.clear()
       },
@@ -848,6 +985,7 @@ async function listProjectRootSessions(api, project, limit = 100) {
   const stream = sessionStream(project)
   const directory = sessionDirectory(project, stream)
   if (!directory) throw new Error(`Project ${project.id} has no session directory`)
+  if (isPendingWorktreeStream(stream) && !existsSync(directory)) return []
   const indexTarget = stream ? readStreamSessionIndex(stream) : readSessionIndex(project)
   const indexedSessionIDs = new Set(Object.keys(indexTarget.sessions))
 
@@ -875,11 +1013,66 @@ async function listProjectRootSessions(api, project, limit = 100) {
 }
 
 async function createProjectSession(api, project) {
-  const directory = sessionDirectory(project, sessionStream(project))
+  const stream = sessionStream(project)
+  if (isPendingWorktreeStream(stream)) return createPendingWorktreeSession(api, project, stream)
+
+  const directory = sessionDirectory(project, stream)
   if (!directory) throw new Error(`Project ${project.id} has no session directory`)
   const sessionID = (await api.client.session.create({ directory })).data?.id
   if (!sessionID) throw new Error("No session id returned")
   recordSession(currentSessionIndexTarget(project), sessionID)
+  api.route.navigate("session", { sessionID })
+  return sessionID
+}
+
+function showCreatingWorktreeDialog(api, stream) {
+  const lines = [
+    {
+      title: "⠋ Creating worktree...",
+      value: "loading",
+      description: "This can take a bit for larger repos.",
+      category: "Status",
+      disabled: true,
+    },
+    {
+      title: `Branch: ${stream.workspace.branch || "unknown"}`,
+      value: "branch",
+      category: "Details",
+      disabled: true,
+    },
+    {
+      title: `Path: ${formatHomePath(stream.workspace.path)}`,
+      value: "path",
+      category: "Details",
+      disabled: true,
+    },
+  ]
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Creating worktree...",
+      placeholder: "Please wait...",
+      options: lines,
+      onSelect() {},
+    }),
+  )
+}
+
+async function createPendingWorktreeSession(api, project, stream) {
+  showCreatingWorktreeDialog(api, stream)
+  await createGitWorktree(stream.workspace)
+  const nextWorkspace = { ...stream.workspace, mode: "git-worktree" }
+  const updatedStream = updateStream(project, stream.id, { workspace: nextWorkspace })
+  selectLocalStream(api, project.id, updatedStream.id)
+
+  const sessionID = (await api.client.session.create({ directory: updatedStream.workspace.path })).data?.id
+  if (!sessionID) throw new Error("No session id returned")
+  recordSession(updatedStream, sessionID)
+  api.ui.toast({
+    variant: "success",
+    title: "Worktree session created",
+    message: `${updatedStream.name} · ${formatHomePath(updatedStream.workspace.path)}`,
+  })
   api.route.navigate("session", { sessionID })
   return sessionID
 }
@@ -1210,19 +1403,34 @@ function showRenameStreamPrompt(api, project, stream) {
 }
 
 function showArchiveStreamConfirm(api, project, stream) {
+  const worktree = isGitWorktreeStream(stream) ? stream.workspace : undefined
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() =>
     api.ui.DialogConfirm({
       title: "Archive stream",
-      message: `Archive stream "${stream.name || stream.id}"? Worklogs, plans, and stream sessions will be kept locally.`,
-      onConfirm() {
+      message: worktree
+        ? [
+          `Archive stream "${stream.name || stream.id}"?`,
+          "",
+          "This will remove the git worktree checkout:",
+          formatHomePath(worktree.path),
+          "",
+          `The stream worklog, plans, sessions, and branch ${worktree.branch || "unknown"} will be kept.`,
+          "If the worktree has uncommitted changes, archive will fail safely.",
+        ].join("\n")
+        : `Archive stream "${stream.name || stream.id}"? Worklogs, plans, and stream sessions will be kept locally.`,
+      async onConfirm() {
         try {
-          archiveStream(project, stream.id)
+          if (worktree) await removeGitWorktree(worktree)
+          const workspace = worktree ? { ...worktree, removedAt: new Date().toISOString(), removeReason: "archived" } : stream.workspace
+          archiveStream(project, stream.id, workspace ? { workspace } : undefined)
           api.ui.dialog.clear()
+          api.ui.toast({ variant: "success", title: "Stream archived", message: stream.name || stream.id })
           showStreamViewer(api, project)
         } catch (error) {
           api.ui.dialog.clear()
-          showError(api, "Failed to archive stream", error)
+          showError(api, worktree ? "Failed to remove worktree" : "Failed to archive stream", error)
+          showStreamViewer(api, project)
         }
       },
       onCancel() {
@@ -1377,19 +1585,82 @@ function showCreateStreamPrompt(api, project) {
           return
         }
 
-        try {
-          const stream = createIndexedStream(project, { name })
-          selectLocalStream(api, project.id, stream.id)
-          api.ui.dialog.clear()
-          showSessionViewer(api, project)
-        } catch (error) {
-          api.ui.dialog.clear()
-          showError(api, "Failed to create stream", error)
-        }
+        if (isGitProject(project)) showCreateStreamWorkspaceChoice(api, project, name)
+        else createAndOpenStream(api, project, { name })
       },
       onCancel() {
         api.ui.dialog.clear()
         showStreamViewer(api, project)
+      },
+    }),
+  )
+}
+
+function createAndOpenStream(api, project, input) {
+  try {
+    const stream = createIndexedStream(project, input)
+    selectLocalStream(api, project.id, stream.id)
+    const worktreeStream = ["git-worktree", "pending-git-worktree"].includes(input.workspace?.mode)
+    if (!worktreeStream || input.workspace?.mode === "git-worktree") {
+      api.ui.toast({
+        variant: "success",
+        title: worktreeStream ? "Worktree stream created" : "Stream created",
+        message: worktreeStream ? `${stream.name} · ${formatHomePath(stream.workspace.path)}` : stream.name,
+      })
+    }
+    api.ui.dialog.clear()
+    showSessionViewer(api, project)
+  } catch (error) {
+    api.ui.dialog.clear()
+    showError(api, "Failed to create stream", error)
+    showStreamViewer(api, project)
+  }
+}
+
+function showCreateStreamWorkspaceChoice(api, project, name) {
+  const repo = gitRepoInfo(project.root)
+  if (!repo) {
+    createAndOpenStream(api, project, { name })
+    return
+  }
+
+  const slug = slugifyPathPart(name)
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Create a new worktree?",
+      placeholder: "Yes or no...",
+      options: [
+        {
+          title: "Yes",
+          value: CREATE_WORKTREE_STREAM,
+          description: `${formatHomePath(path.join(repo.root, ".worktrees", slug))} · stream/${slug}`,
+          category: "Workspace",
+        },
+        {
+          title: "No",
+          value: CREATE_SHARED_STREAM,
+          description: formatHomePath(project.root),
+          category: "Workspace",
+        },
+      ],
+      current: CREATE_WORKTREE_STREAM,
+      onSelect(option) {
+        if (option.value === CREATE_SHARED_STREAM) {
+          createAndOpenStream(api, project, { name })
+          return
+        }
+
+        if (option.value === CREATE_WORKTREE_STREAM) {
+          try {
+            const workspace = gitWorktreeWorkspaceForStream(project, name)
+            createAndOpenStream(api, project, { name, workspace })
+          } catch (error) {
+            api.ui.dialog.clear()
+            showError(api, "Failed to prepare worktree", error)
+            showStreamViewer(api, project)
+          }
+        }
       },
     }),
   )
@@ -1411,16 +1682,24 @@ function sessionOptions(sessions, project) {
 }
 
 function showSessionViewer(api, project) {
+  const initialOptions = sessionOptions([], project)
+  const initialState = { kind: "sessions", project, sessions: [], selected: initialOptions[0] }
+  setModalShortcuts(api, initialState)
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
       title: `Open Projects · Session · ${project.name || project.id}`,
-      placeholder: "Loading sessions...",
-      options: sessionOptions([], project),
+      placeholder: "Search sessions...",
+      options: initialOptions,
+      onMove(option) {
+        initialState.selected = option
+      },
       async onSelect(option) {
+        clearModalShortcuts()
         await openSessionOption(api, project, option)
       },
     }),
+    () => clearModalShortcuts(),
   )
 
   listProjectRootSessions(api, project)
@@ -1446,7 +1725,6 @@ function showSessionViewer(api, project) {
       )
     })
     .catch((error) => {
-      api.ui.dialog.clear()
       showError(api, "Failed to list sessions", error)
     })
 }
@@ -1537,6 +1815,7 @@ async function openSessionOption(api, project, option) {
   } catch (error) {
     api.ui.dialog.clear()
     showError(api, "Failed to open session", error)
+    showSessionViewer(api, project)
   }
 }
 

@@ -68,7 +68,38 @@ Use `plan_read` before acting on a plan. In a scope where multiple plans exist, 
 
 The plugin includes storage primitives for a project registry and explicit user-created streams. Project context is the default. Streams are optional and are intended for separate lines of work that should have their own worklog and plans. Agents should not create or suggest streams automatically; stream selection is intended to be driven by the TUI.
 
-Streams can use the shared project workdir or record an optional git worktree/branch. Worktree merge and cleanup remain explicit user-controlled steps.
+Streams can use either the shared project workdir or a git worktree. Session ownership is index-driven: a session that is already associated with a project or stream keeps that owner even if the local TUI selection changes. This prevents selecting a different stream from silently moving the current session.
+
+### Git worktree streams
+
+When the selected project is inside a git repository, creating a stream asks whether to create a git worktree. Non-git projects do not show the worktree option and create ordinary shared-workdir streams.
+
+The worktree flow is:
+
+1. Choose **New stream**.
+2. Enter the stream name.
+3. Answer **Create a new worktree?** with **Yes** or **No**.
+4. The stream is created and selected immediately.
+5. The normal session picker opens immediately.
+6. If the stream is a pending worktree stream, selecting **New session** shows a loading/status dialog while the worktree is created.
+7. After `git worktree add` completes, the plugin creates the real opencode session in the worktree path and records that session under the stream.
+
+Worktree details:
+
+- Worktree path: `<repo>/.worktrees/<stream-slug>`.
+- Branch name: `stream/<stream-slug>`.
+- If the path or branch already exists, the plugin appends a numeric suffix.
+- `.worktrees/` is added to the repository's local `.git/info/exclude`; committed ignore files are not modified.
+- The stream starts as `pending-git-worktree` and becomes `git-worktree` after the first `New session` creates the checkout.
+- While pending, the session picker treats the stream as having no existing sessions instead of erroring because the directory does not exist yet.
+
+Worktree archive behavior:
+
+- Archiving a worktree stream removes the checkout with `git worktree remove <path>` before archiving the stream.
+- Removal is intentionally non-force. If the worktree has uncommitted changes, Git refuses the cleanup and the stream is not archived.
+- The branch is kept. Branch merge and deletion remain explicit user-controlled steps.
+- Stream worklog, plans, session index data, and opencode sessions are kept locally.
+- The archived stream metadata records `workspace.removedAt` and `workspace.removeReason = "archived"` after successful cleanup.
 
 ### Stream rollups
 
@@ -145,12 +176,13 @@ Current behavior:
 - The project viewer shows active projects sorted by recent session activity, falling back to metadata timestamps. Pressing enter opens the project; project management is shortcut-only (`ctrl+f` pin/unpin, `ctrl+r` rename, `ctrl+d` archive).
 - `New project` opens a directory picker, with a manual path prompt as a fallback, then creates/selects the project and opens its stream viewer.
 - Archived projects are available from the project viewer. Archived projects can be restored with `ctrl+r` or permanently deleted with `ctrl+d`. Permanent delete removes local worklog data only; it does not delete the code repository.
-- The stream viewer selects `Project worklog`, creates a new stream, or selects an existing active stream.
+- The stream viewer selects `Project worklog`, creates a new stream, or selects an existing active stream. In git repositories, creating a stream asks whether to create a git worktree; outside git repositories, normal shared-workdir streams are created without showing the worktree option.
 - The session viewer lists root sessions for the selected project and includes `New session`.
 - Session management remains opencode-owned. The plugin does not implement pin, rename, delete, or override the native session picker.
 - When a stream is selected, `worklog_append` and plan tools use the stream's worklog and plan directories. Selecting `Project worklog` returns to the project worklog.
 - TUI project/stream selection is local to the current opencode window. Server-side worklog context is resolved from the current session index or workdir, not from a global selected project/stream file, so separate opencode instances do not steal each other's active stream.
 - Existing sessions are authoritative: opening a session that is already indexed to another project or stream switches the local TUI context to that session's owner instead of moving the session into the currently selected stream.
+- New sessions created from a git-worktree stream are created under that stream's worktree path, so the opencode session remains associated with the worktree stream.
 - `View worklog` opens the selected project or stream worklog in a searchable read-only dialog.
 - The TUI sidebar shows the current worklog project, stream, session, and project workdir. Opencode's native sidebar/session title remains unchanged.
 
