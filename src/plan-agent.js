@@ -10,6 +10,12 @@ export const DEFAULT_PLAN_AGENT = {
     bash: "ask",
     question: "allow",
     task: "allow",
+    plan_list: "allow",
+    plan_read: "allow",
+    plan_create: "allow",
+    plan_update: "allow",
+    plan_archive: "allow",
+    plan_current: "allow",
   },
   prompt: `You are in plan mode. You may inspect, search, and reason, but you must not create, edit, delete, or move project files. The only write-like exception is opencode's own internal plan storage when the plan workflow needs it.
 

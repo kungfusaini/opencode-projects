@@ -1,6 +1,6 @@
 {
   "name": "@kungfusaini/opencode-projects",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "OpenCode plugin for project contexts, streams, durable plans, and worklog continuity.",
   "type": "module",
   "license": "MIT",
